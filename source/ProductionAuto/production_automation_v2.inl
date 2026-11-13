@@ -109,7 +109,7 @@ static bool PaIdEqual(const PaStableId& a, const PaStableId& b) {
 // 上限与旧版一致：128 组 / 16 箱每组 / 64 机每组
 static constexpr size_t PA_MAX_GROUPS = 128;
 static constexpr size_t PA_MAX_CHESTS_PER_GROUP = 16;
-static constexpr size_t PA_MAX_MACHINES_PER_GROUP = 64;
+static constexpr size_t PA_MAX_MACHINES_PER_GROUP = 256;
 struct PaGroup {
     PaStableId machines[PA_MAX_MACHINES_PER_GROUP];
     size_t machineCount;
