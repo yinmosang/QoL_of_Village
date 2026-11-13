@@ -1086,6 +1086,10 @@ extern std::atomic<bool> g_paChainActive;
 extern "C" __declspec(dllexport) void mod_init(void) {
     LogOpen("productionauto");
     qol::obs::Init(nullptr);  // v1.6.x: 统一观测层接入
+    // 2026-11-14：让本 DLL 接管共享浮层窗口。其它已装 MOD 的 DLL 是旧编译版
+    // （内部仍按 2500ms 判定），不接管的话本 MOD 的 5 秒提示会被它们提前隐藏。
+    // 想退回原行为，注释掉这一行即可。
+    qol::obs::TakeoverWindow();
     // 2026-10-29：此处版本号曾长期写死 v1.5.98（实际早已 v1.6.x），排查时被误导
     //   过一次。版本号本身由部署目录名决定，这里只能手写同步 —— 改版时务必一起改。
     Log("[ProductionAuto] mod_init loaded, build %s %s, MOD v1.6.60\n",
@@ -1237,7 +1241,7 @@ extern "C" __declspec(dllexport) void mod_init(void) {
     // v1.6.60：Case B 观测面板用独立命名空间（pa 8 槽已满，详见 .inl:2205 注释）；
     // 此处立即建槽，使观测器在维护链尚未跑起来时也能确认新 DLL 已加载。
     PaCaseBObsPublish();
-    qol::obs::EventF(1, 2500, L"[PA] 已加载：观测层已接入（时钟/邻近/加工就绪）");
+    qol::obs::EventF(1, qol::obs::OBS_TOAST_MS, L"[PA] 已加载：观测层已接入（时钟/邻近/加工就绪）");
 
     Log("[ProductionAuto] v2 init done\n");
 }

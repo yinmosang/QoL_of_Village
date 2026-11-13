@@ -48,6 +48,10 @@ static const int    OBS_KLEN      = 20;
 static const int    OBS_SLEN      = 48;
 static const int    OBS_EVTS      = 64;
 static const int    OBS_ETXT      = 96;
+// 2026-11-14：所有 toast 悬浮停留时长（ms）。原本 5 处硬编码 2500，
+// 而 EventF/Event 的 durationMs 参数其实被忽略；现在只改这一个数字即可全局调整。
+// 注意：本 header 每个 DLL 各编译一份，只有重新编译过的 DLL 才会用新值。
+static const int    OBS_TOAST_MS  = 5000;
 
 struct ObsMod {
     char          name[16];
@@ -92,6 +96,13 @@ inline void obsRedraw(HWND);
 // 自动隐藏：不依赖窗口线程的消息循环（历史失败根因之一）。
 static volatile LONG g_obsHideAt     = 0;   // GetTickCount 过期时刻，0=无待隐藏
 static volatile LONG g_obsHideThread = 0;   // 1=已有隐藏线程在跑
+// 2026-11-14：浮层窗口归「首个 Init 的 DLL」所有。若那是未重编译的旧 DLL，
+// 它的 ObsWndProc 仍按 2500ms 判定，会把新时长的 toast 提前隐藏。
+// 由新 DLL 在 mod_init 里显式调 TakeoverWindow()，首次 obsPush 时把 ownerWnd
+// 换成本 DLL 建的窗口，使所有 DLL 共用的浮层统一按 OBS_TOAST_MS 计时。
+// 该标志是每 DLL 各自的 static，只有调用方会接管一次；不调用则完全保持原行为。
+static volatile LONG g_obsTakeoverPending = 0;
+inline void TakeoverWindow() { InterlockedExchange(&g_obsTakeoverPending, 1); }
 
 // ---------------- 内部：找/建 MOD 槽 ----------------
 inline ObsMod* obsFindMod(const char* mod) {
@@ -143,18 +154,18 @@ inline DWORD WINAPI obsHideThread(LPVOID) {
         // 新事件，会把刚显示的窗口立刻藏掉 —— 21:02 实机 visible 在
         // True/False 间跳变、判据最终落在 HIDDEN 就是这个竞态。
         // 隐藏决策改以「共享 events[] 里最新事件时刻」为准：所有 DLL 读同一份
-        // 真相，仍有 2500ms 内的事件就顺延，绝不抢在别人的 toast 前面隐藏。
+        // 真相，仍有 OBS_TOAST_MS 内的事件就顺延，绝不抢在别人的 toast 前面隐藏。
         DWORD latest = 0;
         if (g_obs) {
             for (int i = 0; i < OBS_EVTS; ++i) {
                 const ObsEvent* ev = &g_obs->events[i];
                 if (ev->used && ev->t && now >= ev->t &&
-                    (now - ev->t) < 2500 && ev->t > latest)
+                    (now - ev->t) < OBS_TOAST_MS && ev->t > latest)
                     latest = ev->t;
             }
         }
         if (latest) {
-            const DWORD nextExp = latest + 2500;
+            const DWORD nextExp = latest + OBS_TOAST_MS;
             if ((LONG)(nextExp - now) > 0) {
                 InterlockedExchange(&g_obsHideAt, (LONG)nextExp);
                 continue;
@@ -169,7 +180,7 @@ inline DWORD WINAPI obsHideThread(LPVOID) {
     }
 }
 inline void obsScheduleHide() {
-    InterlockedExchange(&g_obsHideAt, (LONG)(GetTickCount() + 2500));
+    InterlockedExchange(&g_obsHideAt, (LONG)(GetTickCount() + OBS_TOAST_MS));
     if (InterlockedCompareExchange(&g_obsHideThread, 1, 0) == 0) {
         HANDLE th = CreateThread(nullptr, 0, obsHideThread, nullptr, 0, nullptr);
         if (th) CloseHandle(th);
@@ -178,7 +189,10 @@ inline void obsScheduleHide() {
 }
 
 inline void obsPush(const wchar_t* text, int severity, int durationMs) {
-    (void)durationMs;  // 停留时长由 2500ms 事件窗口 + 隐藏线程控制
+    // 2026-11-14：单条 durationMs 仍不参与判定 —— 要支持逐条时长就得往
+    // ObsEvent 加字段，会改变共享内存布局，与未重编译的旧 DLL 失配（有崩溃风险）。
+    // 统一走 OBS_TOAST_MS；调用处传 OBS_TOAST_MS 只为语义一致。
+    (void)durationMs;
     if (!g_obs) return;
 
     // 关键：不再假设「首个 Init 的 DLL 一定建过窗口」。任何 DLL 发 toast 时，
@@ -215,7 +229,7 @@ inline void obsPush(const wchar_t* text, int severity, int durationMs) {
         obsScheduleHide();                    // 消息循环不正常时的隐藏兜底
     }
 }
-inline void Event(const wchar_t* text, int severity = 0, int durationMs = 2000) {
+inline void Event(const wchar_t* text, int severity = 0, int durationMs = OBS_TOAST_MS) {
     obsPush(text, severity, durationMs);
 }
 inline void __cdecl EventF(int severity, int durationMs, const wchar_t* fmt, ...) {
@@ -266,7 +280,7 @@ inline void obsPaintWindow(HWND w, HDC dc) {
         int shown = 0;
         for (int i = OBS_EVTS - 1; i >= 0 && shown < 4; --i) {
             ObsEvent* e = &g_obs->events[i];
-            if (!e->used || now - e->t >= 2500) continue;
+            if (!e->used || now - e->t >= OBS_TOAST_MS) continue;
             SetTextColor(dc, obsParseColor(obsSevColor(e->severity)));
             RECT tr = {8, y, rc.right - 8, y + lineH};
             DrawTextW(dc, e->text, -1, &tr,
@@ -315,7 +329,7 @@ inline LRESULT CALLBACK ObsWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             DWORD now = GetTickCount();
             for (int i = 0; i < OBS_EVTS; ++i) {
                 ObsEvent* e = &g_obs->events[i];
-                if (e->used && now - e->t < 2500) { any = true; break; }
+                if (e->used && now - e->t < OBS_TOAST_MS) { any = true; break; }
             }
         }
         if (any) {
@@ -342,19 +356,39 @@ inline LRESULT CALLBACK ObsWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 // 永远不显示（2026-11-07 23:16 实机：仅自建窗口的 TF/PA/CameraZoom 有 HUD）。
 inline HWND obsEnsureWindow() {
     if (!g_obs) return nullptr;
-    if (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd)) return g_obs->ownerWnd;
+    // 一次性接管请求（只有显式调过 TakeoverWindow() 且自己不是窗口 owner 的 DLL 会置位）
+    const bool requested =
+        (InterlockedCompareExchange(&g_obsTakeoverPending, 0, 1) == 1);
+    const bool take = !g_obsOwner && requested;
+    if (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd) && !take)
+        return g_obs->ownerWnd;
 
     HANDLE mx = CreateMutexW(nullptr, FALSE, L"QolObsWndLock");
     if (mx) WaitForSingleObject(mx, 3000);
     HWND w = nullptr;
-    if (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd)) {
-        w = g_obs->ownerWnd;
+    HWND oldWnd = (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd))
+        ? g_obs->ownerWnd : nullptr;
+    if (oldWnd && !take) {
+        w = oldWnd;
     } else {
+        if (oldWnd && take) {
+            // 旧窗口的消息循环按它自己编译时的 2500ms 判定，会抢在
+            // OBS_TOAST_MS 之前把共享浮层藏掉；停轮询并隐藏，交由新窗口接管。
+            KillTimer(oldWnd, 1);
+            ShowWindow(oldWnd, SW_HIDE);
+        }
         HMODULE self = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT |
                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                            (LPCWSTR)&obsEnsureWindow, &self);
-        if (!self) { if (mx) { ReleaseMutex(mx); CloseHandle(mx); } return nullptr; }
+        if (!self) {
+            if (oldWnd && take) {   // 接管失败：把旧窗口还回去，别让 toast 全部消失
+                g_obs->ownerWnd = oldWnd;
+                SetTimer(oldWnd, 1, 250, nullptr);
+            }
+            if (mx) { ReleaseMutex(mx); CloseHandle(mx); }
+            return nullptr;
+        }
         WNDCLASSEXW wc = {};
         bool clsOk = (self && GetClassInfoExW(self, OBS_CLS, &wc) != 0);
         if (!clsOk) {
@@ -392,6 +426,11 @@ inline HWND obsEnsureWindow() {
                 ShowWindow(w, SW_HIDE);
             }
         }
+    }
+    if (!w && oldWnd && take) {
+        // 接管失败：把旧窗口还回去，别让 toast 全部消失
+        g_obs->ownerWnd = oldWnd;
+        SetTimer(oldWnd, 1, 250, nullptr);
     }
     if (mx) { ReleaseMutex(mx); CloseHandle(mx); }
     return w;
@@ -488,7 +527,7 @@ inline void Shutdown() {
 
 // ---------------- 兼容别名（便于渐进迁移既有 Show 调用） ----------------
 namespace qol { namespace toast {
-    inline void Show(const wchar_t* text, int severity = 0, int durationMs = 2000) {
+    inline void Show(const wchar_t* text, int severity = 0, int durationMs = OBS_TOAST_MS) {
         qol::obs::Event(text, severity, durationMs);
     }
     inline void __cdecl ShowF(int severity, int durationMs, const wchar_t* fmt, ...) {

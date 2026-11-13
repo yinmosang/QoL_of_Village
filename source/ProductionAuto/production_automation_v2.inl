@@ -109,7 +109,7 @@ static bool PaIdEqual(const PaStableId& a, const PaStableId& b) {
 // 上限与旧版一致：128 组 / 16 箱每组 / 64 机每组
 static constexpr size_t PA_MAX_GROUPS = 128;
 static constexpr size_t PA_MAX_CHESTS_PER_GROUP = 16;
-static constexpr size_t PA_MAX_MACHINES_PER_GROUP = 256;
+static constexpr size_t PA_MAX_MACHINES_PER_GROUP = 256;  // 原值 64；超过的机器会被丢出连通组
 struct PaGroup {
     PaStableId machines[PA_MAX_MACHINES_PER_GROUP];
     size_t machineCount;
@@ -1093,6 +1093,15 @@ static bool PaReadStatusInt(void* status, const char* key, int* valueOut) {
 }
 
 // ============================================================
+// 2026-11-14【多同型机修复】下方一批 UI / 投料状态表原先一律以
+//   gimmickId（机型）为键：一排同型号机器（如蜂箱）共用一个冷却/退避槽
+//   → 只有第一台能写 UIManpu 键保持「点火」，或一台投料失败把整个机型
+//   冷却 60s。改为按机器 status 指针（实例）区分，必要时叠加 kind 分量。
+static inline u64 PaInstanceKey(const void* status, u64 kind = 0) {
+    const u64 p = static_cast<u64>(reinterpret_cast<uintptr_t>(status));
+    return p ^ (kind * 0x9E3779B97F4A7C15ULL);
+}
+// ============================================================
 // v1.5.26：被动机器（蜂箱 / 采汁器 / 蚕盒）——定时器恒 0，产出靠
 //   itemID/itemVal 键，不走 timer 路径。v2 重写时丢了这段旧版逻辑
 //   （KB-017 / ARCHIVE v1.1.2），导致蚕盒产出永远不转移。
@@ -1938,19 +1947,20 @@ static void PaCreateProcessingUi(void* machineStatus, u64 gid, bool fromAutoFeed
     //   每次尾部都 event-notify → 游戏面板被连轰 12 次重建通知 = 疯狂闪。
     //   push 当帧建 manpu 的真实目的只有一个：把 UIManpu 键写上（保加工组件
     //   存活，KB-087/v1.5.89）——**写一次就够**，与投几个槽无关。
-    //   故加 per-gid 30 秒装配冷却：同机 30 秒内只装配一次。
+    //   故加 30 秒装配冷却：同一台机器 30 秒内只装配一次。
     {
         struct PaAsmCool { u64 gid; u64 tick; };
-        static PaAsmCool s_cool[16] = {};
+        static PaAsmCool s_cool[512] = {};   // 2026-11-14 按实例隔离
         static size_t s_cur = 0;
         const u64 now = GetTickCount64();
+        const u64 instKey = PaInstanceKey(machineStatus);
         PaAsmCool* e = nullptr;
-        for (size_t k = 0; k < 16; ++k)
-            if (s_cool[k].tick && s_cool[k].gid == gid) { e = &s_cool[k]; break; }
+        for (size_t k = 0; k < 512; ++k)
+            if (s_cool[k].gid == instKey) { e = &s_cool[k]; break; }
         if (!e) {
-            e = &s_cool[s_cur % 16];
+            e = &s_cool[s_cur % 512];
             ++s_cur;
-            e->gid = gid;
+            e->gid = instKey;
             e->tick = now;
         } else if (now - e->tick < 30000ULL) {
             qol::obs::SetInt("paui", "cool", (int)s_pauiCool.fetch_add(1) + 1);
@@ -2024,8 +2034,14 @@ static void PaCreateProcessingUi(void* machineStatus, u64 gid, bool fromAutoFeed
                             g_paCapturedBaseId.load(std::memory_order_relaxed));
     if (!baseFar && !baseManpu) {  // 无合法 baseID：静默降级
         qol::obs::SetInt("pa", "uiDegrade", 1);
-        qol::obs::EventF(3, 2500,
-            L"[PA] 自动投料机无合法 baseID：far/manpu UI 未建（动画回归风险）");
+        // 2026-11-14：恢复为浮层 qol::obs::OBS_TOAST_MS ms；同条在窗口期内只发一次，避免刷屏。
+        static u64 s_lastBaseIdToast = 0;
+        const u64 baseToastNow = GetTickCount64();
+        if (s_lastBaseIdToast == 0 || baseToastNow - s_lastBaseIdToast >= qol::obs::OBS_TOAST_MS) {
+            s_lastBaseIdToast = baseToastNow;
+            qol::obs::EventF(3, qol::obs::OBS_TOAST_MS,
+                L"[PA] 自动投料机无合法 baseID：far/manpu UI 未建（动画回归风险）");
+        }
         return;
     }
     const uintptr_t st = reinterpret_cast<uintptr_t>(machineStatus);
@@ -2055,8 +2071,15 @@ static void PaCreateProcessingUi(void* machineStatus, u64 gid, bool fromAutoFeed
         qol::obs::SetInt("pa", "uiFarCount",    s_farOk);
         qol::obs::SetInt("pa", "uiManpuCount",  s_manOk);
         if (!manOk) {
-            qol::obs::EventF(2, 2500,
-                L"[PA] manpu UI 建失败（加工动画可能缺失）");
+            // 2026-11-14：恢复为浮层 qol::obs::OBS_TOAST_MS ms；同条在窗口期内只发一次，
+            // 避免 256 台机器同时维护动画时把 toast 刷成常驻。
+            static u64 s_lastManpuToast = 0;
+            const u64 manpuToastNow = GetTickCount64();
+            if (s_lastManpuToast == 0 || manpuToastNow - s_lastManpuToast >= qol::obs::OBS_TOAST_MS) {
+                s_lastManpuToast = manpuToastNow;
+                qol::obs::EventF(2, qol::obs::OBS_TOAST_MS,
+                    L"[PA] manpu UI 建失败（加工动画可能缺失）");
+            }
         }
     }
 
@@ -2303,10 +2326,11 @@ static void PaTxObsPublish() {
 //   "PA 自己建过"的机器上触发（手投机器 PA 从没建过 → 不触发 → 不会闪）。
 namespace {
 struct PaUiCreatedRec { u64 key; bool created; };
-static PaUiCreatedRec s_uiCreated[64] = {};
-static void PaUiMarkCreated(u64 gid, PaUiKind kind) {
-    const u64 key = gid * 3ULL + static_cast<u64>(kind);
-    for (int i = 0; i < 64; ++i) {
+static PaUiCreatedRec s_uiCreated[512] = {};
+static void PaUiMarkCreated(uintptr_t st, PaUiKind kind) {
+    const u64 key = PaInstanceKey(reinterpret_cast<void*>(st),
+                                  static_cast<u64>(kind));
+    for (int i = 0; i < 512; ++i) {
         if (s_uiCreated[i].key == key || !s_uiCreated[i].created) {
             s_uiCreated[i].key = key;
             s_uiCreated[i].created = true;
@@ -2314,9 +2338,10 @@ static void PaUiMarkCreated(u64 gid, PaUiKind kind) {
         }
     }
 }
-static bool PaUiCreatedQ(u64 gid, PaUiKind kind) {
-    const u64 key = gid * 3ULL + static_cast<u64>(kind);
-    for (int i = 0; i < 64; ++i)
+static bool PaUiCreatedQ(uintptr_t st, PaUiKind kind) {
+    const u64 key = PaInstanceKey(reinterpret_cast<void*>(st),
+                                  static_cast<u64>(kind));
+    for (int i = 0; i < 512; ++i)
         if (s_uiCreated[i].key == key && s_uiCreated[i].created) return true;
     return false;
 }
@@ -2324,14 +2349,15 @@ static bool PaUiCreatedQ(u64 gid, PaUiKind kind) {
 //   相同=对象仍活，不再清键重建（避免每 5s 反复清活对象导致闪烁）；仅当游戏把对象重新
 //   弄脏（键值变化）才再触发。key = gid*3 + kind。
 struct PaCaseBEst { u64 key; u64 estVal; };
-static PaCaseBEst s_caseBEst[64] = {};
-static u64* PaCaseBEstGet(u64 gid, PaUiKind kind) {
-    const u64 key = gid * 3ULL + static_cast<u64>(kind);
-    for (int i = 0; i < 64; ++i)
+static PaCaseBEst s_caseBEst[512] = {};
+static u64* PaCaseBEstGet(uintptr_t st, PaUiKind kind) {
+    const u64 key = PaInstanceKey(reinterpret_cast<void*>(st),
+                                  static_cast<u64>(kind));
+    for (int i = 0; i < 512; ++i)
         if (s_caseBEst[i].key == key) return &s_caseBEst[i].estVal;
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < 512; ++i)
         if (s_caseBEst[i].key == 0) { s_caseBEst[i].key = key; s_caseBEst[i].estVal = 0; return &s_caseBEst[i].estVal; }
-    return &s_caseBEst[key % 64].estVal;  // 满槽退化为哈希槽
+    return &s_caseBEst[key % 512].estVal;  // 满槽退化为哈希槽
 }
 }
 
@@ -2388,15 +2414,16 @@ static uintptr_t PaUiCreateGuarded(PaUiCreateFn fn, u64 baseId, uintptr_t st,
         bool used;
         void* seenActor;  // v1.6.62：上次创建时该机收获到的 actor（用于解锁退避）
     };
-    static PaUiGuardSlot s_slots[32] = {};
+    static PaUiGuardSlot s_slots[512] = {};   // 2026-11-14 按实例隔离
     static size_t s_cur = 0;
-    const u64 key = gid * 3ULL + static_cast<u64>(kind);  // v1.6.51: 3 种 kind
+    const u64 key = PaInstanceKey(reinterpret_cast<void*>(st),
+                                  static_cast<u64>(kind));
     PaUiGuardSlot* s = nullptr;
-    for (size_t k = 0; k < 32; ++k) {
+    for (size_t k = 0; k < 512; ++k) {
         if (s_slots[k].used && s_slots[k].key == key) { s = &s_slots[k]; break; }
     }
     if (!s) {
-        s = &s_slots[s_cur % 32];
+        s = &s_slots[s_cur % 512];
         ++s_cur;
         s->key = key;
         s->used = true;
@@ -2487,7 +2514,7 @@ static uintptr_t PaUiCreateGuarded(PaUiCreateFn fn, u64 baseId, uintptr_t st,
     }
     if (r) {
         s->fails = 0;
-        PaUiMarkCreated(gid, kind);  // v1.6.59：标记 PA 已成功建过该机该型 UI（供 Case B 脏键恢复判定）
+        PaUiMarkCreated(st, kind);  // v1.6.59 / 2026-11-14 按实例：标记 PA 已成功建过该机该型 UI（供 Case B 脏键恢复判定）
         s->gapMs = 8000ULL;  // 成功后 8 秒冷静期：远 UI 不会又被打掉重建
     } else {
         // v1.6.41【失败限次】失败的 far/manpu 创建**同样**会让游戏走到
@@ -2528,6 +2555,8 @@ static uintptr_t PaUiCreateGuarded(PaUiCreateFn fn, u64 baseId, uintptr_t st,
 static volatile int g_paSkipWhenPlayerNear = 0;
 
 static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
+    // 2026-11-14：本机实例键（下方所有节流/记忆表按实例隔离，不再按机型共用）
+    const u64 instKey = PaInstanceKey(machineStatus);
 
     // v1.6.63【配对诊断】harvest 表里的 status 与 PA 维护的 machineStatus
     //   是否为同一指针？若不同，则 PaBaseHarvestGet/PaActorHarvestGet 永远
@@ -2601,21 +2630,21 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
     //   纪律：纯读 + SEH + per-gid 3 秒节流，零行为变更。
     {
         struct PaAliveTick { u64 gid; u64 tick; };
-        static PaAliveTick s_aliveTick[16] = {};
+        static PaAliveTick s_aliveTick[512] = {};
         static size_t s_aliveCur = 0;
         static std::atomic<int> s_aliveSeq{0};
         const u64 aliveNow = GetTickCount64();
         PaAliveTick* ae = nullptr;
-        for (size_t k = 0; k < 16; ++k) {
-            if (s_aliveTick[k].tick != 0 && s_aliveTick[k].gid == gid) {
+        for (size_t k = 0; k < 512; ++k) {
+            if (s_aliveTick[k].gid == instKey) {
                 ae = &s_aliveTick[k];
                 break;
             }
         }
         if (!ae) {
-            ae = &s_aliveTick[s_aliveCur % 16];
+            ae = &s_aliveTick[s_aliveCur % 512];
             ++s_aliveCur;
-            ae->gid = gid;
+            ae->gid = instKey;
             ae->tick = 0;
         }
         if (ae->tick == 0 || aliveNow - ae->tick >= 3000ULL) {
@@ -2655,19 +2684,19 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
     bool justLeft = false;
     {
         struct PaNearState { u64 gid; int lastNearNow; bool used; };
-        static PaNearState s_near[16] = {};
+        static PaNearState s_near[512] = {};
         static size_t s_cursor = 0;
         PaNearState* e = nullptr;
-        for (size_t k = 0; k < 16; ++k) {
-            if (s_near[k].used && s_near[k].gid == gid) {
+        for (size_t k = 0; k < 512; ++k) {
+            if (s_near[k].used && s_near[k].gid == instKey) {
                 e = &s_near[k];
                 break;
             }
         }
         if (!e) {
-            e = &s_near[s_cursor % 16];
+            e = &s_near[s_cursor % 512];
             ++s_cursor;
-            e->gid = gid;
+            e->gid = instKey;
             e->used = true;
             e->lastNearNow = nearNow ? 1 : 0;
             // 首见即视为"刚走开"：保证每台加工机至少拿到一次 far/manpu 装配机会。
@@ -2715,19 +2744,19 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
     bool refreshFar = false;
     {
         struct PaFarMemo { u64 gid; u64 seenKey; bool used; };
-        static PaFarMemo s_memo[16] = {};
+        static PaFarMemo s_memo[512] = {};
         static size_t s_cursor = 0;
         PaFarMemo* m = nullptr;
-        for (size_t k = 0; k < 16; ++k) {
-            if (s_memo[k].used && s_memo[k].gid == gid) {
+        for (size_t k = 0; k < 512; ++k) {
+            if (s_memo[k].used && s_memo[k].gid == instKey) {
                 m = &s_memo[k];
                 break;
             }
         }
         if (!m) {
-            m = &s_memo[s_cursor % 16];
+            m = &s_memo[s_cursor % 512];
             ++s_cursor;
-            m->gid = gid;
+            m->gid = instKey;
             m->seenKey = 0;
             m->used = true;
         }
@@ -2765,12 +2794,12 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
         //   15 秒/台的开销可忽略（每台每 15 秒一次调用 + 一次 baseID 解析）。
         {
             struct PaFarRefresh { u64 gid; u64 tick; };
-            static PaFarRefresh s_refresh[16] = {};
+            static PaFarRefresh s_refresh[512] = {};
             static size_t s_cursor2 = 0;
             const u64 nowTick = GetTickCount64();
             PaFarRefresh* e = nullptr;
-            for (size_t k = 0; k < 16; ++k) {
-                if (s_refresh[k].tick != 0 && s_refresh[k].gid == gid) {
+            for (size_t k = 0; k < 512; ++k) {
+                if (s_refresh[k].gid == instKey) {
                     e = &s_refresh[k];
                     break;
                 }
@@ -2781,9 +2810,9 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
             //   留的是游戏早已作废的句柄 → 走远什么都看不到。故恢复为开。
             static volatile long s_farPeriodicRefresh = 1;  // 1=开（15s/台保活重建）
             if (!e) {
-                e = &s_refresh[s_cursor2 % 16];
+                e = &s_refresh[s_cursor2 % 512];
                 ++s_cursor2;
-                e->gid = gid;
+                e->gid = instKey;
                 e->tick = nowTick;
                 refreshFar = true;
             // v1.6.15【闪烁修复】原逻辑每到 15 秒就把 far UI 无条件重建一次
@@ -2815,16 +2844,16 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
         //   手投机器 PA 从没建过 → 不触发 → 不会闪。
         bool caseBFar = false;
         if (g_paUiCaseBFix && !nearNow && farKey && farVal &&
-            PaUiCreatedQ(gid, PaUiKind::kFar)) {
+            PaUiCreatedQ(st, PaUiKind::kFar)) {
             struct PaCaseB { u64 gid; u64 tick; };
-            static PaCaseB s_cb[16] = {};
+            static PaCaseB s_cb[512] = {};
             static size_t s_cbc = 0;
             const u64 nowCb = GetTickCount64();
             PaCaseB* e = nullptr;
-            for (size_t k = 0; k < 16; ++k)
-                if (s_cb[k].gid == gid) { e = &s_cb[k]; break; }
-            if (!e) { e = &s_cb[s_cbc % 16]; ++s_cbc; e->gid = gid; e->tick = 0; }
-            u64* est = PaCaseBEstGet(gid, PaUiKind::kFar);
+            for (size_t k = 0; k < 512; ++k)
+                if (s_cb[k].gid == instKey) { e = &s_cb[k]; break; }
+            if (!e) { e = &s_cb[s_cbc % 512]; ++s_cbc; e->gid = instKey; e->tick = 0; }
+            u64* est = PaCaseBEstGet(st, PaUiKind::kFar);
             // 幂等：当前键值==上次建立的键值（对象仍活）→ 不清；键值变化（游戏重新弄脏）才清。
             if (farVal != *est && nowCb - e->tick >= 5000ULL) {
                 e->tick = nowCb;
@@ -2891,7 +2920,7 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
                 (afterOk && afterVal != farVal) ? "键已更新(成功)"
                                                 : "键未变(函数早退)");
             if (caseBFar)
-                *PaCaseBEstGet(gid, PaUiKind::kFar) = afterOk ? afterVal : 0;
+                *PaCaseBEstGet(st, PaUiKind::kFar) = afterOk ? afterVal : 0;
         } else if (needFarCreate) {
             PaUiDiagLog(gid, "no-baseid", nearVal, 0, 0, farKey, farVal, 0);
         }
@@ -2966,16 +2995,16 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
         bool manpuPeriodic = false;
         {
             struct PaMpTick { u64 gid; u64 tick; };
-            static PaMpTick s_mp[16] = {};
+            static PaMpTick s_mp[512] = {};
             static size_t s_mpCur = 0;
             const u64 nowM = GetTickCount64();
             PaMpTick* e = nullptr;
-            for (size_t k = 0; k < 16; ++k)
-                if (s_mp[k].tick && s_mp[k].gid == gid) { e = &s_mp[k]; break; }
+            for (size_t k = 0; k < 512; ++k)
+                if (s_mp[k].gid == instKey) { e = &s_mp[k]; break; }
             if (!e) {
-                e = &s_mp[s_mpCur % 16];
+                e = &s_mp[s_mpCur % 512];
                 ++s_mpCur;
-                e->gid = gid;
+                e->gid = instKey;
                 e->tick = nowM;
                 manpuPeriodic = true;
             } else if (nowM - e->tick >= 20000ULL) {
@@ -3038,14 +3067,14 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
         bool caseBNear = false;
         if (g_paUiCaseBFix && !nearNow && nearPresent && paManaged) {
             struct PaCaseBN { u64 gid; u64 tick; };
-            static PaCaseBN s_cbn[16] = {};
+            static PaCaseBN s_cbn[512] = {};
             static size_t s_cbnCur = 0;
             const u64 nowC = GetTickCount64();
             PaCaseBN* e = nullptr;
-            for (size_t k = 0; k < 16; ++k)
-                if (s_cbn[k].gid == gid) { e = &s_cbn[k]; break; }
-            if (!e) { e = &s_cbn[s_cbnCur % 16]; ++s_cbnCur; e->gid = gid; e->tick = 0; }
-            u64* est = PaCaseBEstGet(gid, PaUiKind::kNear);
+            for (size_t k = 0; k < 512; ++k)
+                if (s_cbn[k].gid == instKey) { e = &s_cbn[k]; break; }
+            if (!e) { e = &s_cbn[s_cbnCur % 512]; ++s_cbnCur; e->gid = instKey; e->tick = 0; }
+            u64* est = PaCaseBEstGet(st, PaUiKind::kNear);
             // 幂等：当前键值==上次建立的键值（对象仍活）→ 不清；键值变化（游戏重新弄脏）才清。
             if (upNow != *est && nowC - e->tick >= 5000ULL) {
                 e->tick = nowC;
@@ -3075,16 +3104,16 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
             bool due = false;
             {
                 struct PaNearTick { u64 gid; u64 tick; };
-                static PaNearTick s_nt[16] = {};
+                static PaNearTick s_nt[512] = {};
                 static size_t s_ntCur = 0;
                 const u64 nowN = GetTickCount64();
                 PaNearTick* e = nullptr;
-                for (size_t k = 0; k < 16; ++k)
-                    if (s_nt[k].tick && s_nt[k].gid == gid) { e = &s_nt[k]; break; }
+                for (size_t k = 0; k < 512; ++k)
+                    if (s_nt[k].gid == instKey) { e = &s_nt[k]; break; }
                 if (!e) {
-                    e = &s_nt[s_ntCur % 16];
+                    e = &s_nt[s_ntCur % 512];
                     ++s_ntCur;
-                    e->gid = gid;
+                    e->gid = instKey;
                     e->tick = nowN;
                     due = true;
                 } else if (nowN - e->tick >= 2000ULL) {  // 键空时尽快补（2s 节流，别每 tick 轰）
@@ -3106,7 +3135,7 @@ static void PaMaintainProcessingUi(void* machineStatus, u64 gid) {
             const bool afterNOk =
                 PaStatusKeyPresent(machineStatus, "UIPros", &afterN);
             if (caseBNear)
-                *PaCaseBEstGet(gid, PaUiKind::kNear) = afterNOk ? afterN : 0;
+                *PaCaseBEstGet(st, PaUiKind::kNear) = afterNOk ? afterN : 0;
             Log("[PA][nearui] gid=%llu 远离补建 near(脏键恢复) base=%llu present=%d "
                 "ret=%p\n",
                 static_cast<unsigned long long>(gid),
@@ -5809,7 +5838,7 @@ static void PaTick(const PaWorldContext* ctx) {
             // 玩家澄清的正确语义 = 泛洪（flood-fill）：
             //   · 机器/箱子按 1 格邻接连成连通块；中间隔一格（2 格）即断开
             //   · 连通块内有 ≥1 个箱子 → 整块机器都由该块箱子供料
-            //   · 一组上限 64 台机器（PA_MAX_MACHINES_PER_GROUP）
+            //   · 一组上限 256 台机器（PA_MAX_MACHINES_PER_GROUP，原 64）
             // 因此这里不做单机邻箱校验，连通性完全交给 PaBuildGroups。
 
             // 防御（v1.5.8）：机器 gimmickId 必须在本 MOD 配方表中有索引，
@@ -6116,18 +6145,19 @@ static void PaTick(const PaWorldContext* ctx) {
                     //   失败 60 秒内不再试该机器（料不会自己长出来；放料后冷却
                     //   自然过期恢复）。
                     struct PaInputCool { u64 gid; u64 tick; };
-                    static PaInputCool s_cool[32] = {};
+                    static PaInputCool s_cool[512] = {};  // 2026-11-14 按实例隔离
                     static size_t s_cur = 0;
                     const u64 nowTick = GetTickCount64();
+                    const u64 instKey = PaInstanceKey(machine->status);
                     PaInputCool* e = nullptr;
-                    for (size_t k = 0; k < 32; ++k)
-                        if (s_cool[k].tick && s_cool[k].gid == machine->gimmickId) {
+                    for (size_t k = 0; k < 512; ++k)
+                        if (s_cool[k].gid == instKey) {
                             e = &s_cool[k]; break;
                         }
                     if (!e) {
-                        e = &s_cool[s_cur % 32];
+                        e = &s_cool[s_cur % 512];
                         ++s_cur;
-                        e->gid = machine->gimmickId;
+                        e->gid = instKey;
                         e->tick = 0;
                     }
                     const bool cooled = e->tick && (nowTick - e->tick < 60000ULL);
