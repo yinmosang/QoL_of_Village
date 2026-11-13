@@ -527,7 +527,7 @@ inline void Shutdown() {
 
 // ---------------- 兼容别名（便于渐进迁移既有 Show 调用） ----------------
 namespace qol { namespace toast {
-    inline void Show(const wchar_t* text, int severity = 0, int durationMs = OBS_TOAST_MS) {
+    inline void Show(const wchar_t* text, int severity = 0, int durationMs = qol::obs::OBS_TOAST_MS) {
         qol::obs::Event(text, severity, durationMs);
     }
     inline void __cdecl ShowF(int severity, int durationMs, const wchar_t* fmt, ...) {
