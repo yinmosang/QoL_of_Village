@@ -1,0 +1,40 @@
+name: Build ProductionAuto DLL
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths:
+      - 'source/ProductionAuto/**'
+      - 'source/QoL_Shared/**'
+      - '.github/workflows/build-productionauto.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        run: >
+          msbuild source\ProductionAuto\ProductionAuto.vcxproj
+          /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+          /m /v:minimal
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $dll = "source\bin\x64\Release\productionauto.dll"
+          if (-not (Test-Path $dll)) { throw "productionauto.dll was not produced" }
+          Get-Item $dll | Select-Object FullName, Length
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: productionauto
+          path: source\bin\x64\Release\productionauto.dll
+          if-no-files-found: error
