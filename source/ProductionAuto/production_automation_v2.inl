@@ -142,6 +142,10 @@ static volatile int g_paRancherAuto = 0;
 //   只读追踪 save 前 0x4000 字节的变化，用于定位「图鉴登记位」；
 //   不写游戏内存、不装 hook。删文件即完全关闭。
 static volatile int g_paCollectionProbe = 0;
+// 2026-11-14【矿洞探针】qol_pa_mineclear_probe.txt 存在时开启。
+//   只读：统计全场 gimmick 模块名分布 + 检测背包新增物品，
+//   用于定位矿点对象类型与挖矿掉落事件。零写入、零 hook。
+static volatile int g_paMineProbe = 0;
 // v1.5.53-diag：投料后触碰 UI 同步键（UIManpu+1），触发面板重绘。
 // v1.5.78 尝试：g_paTouchUi=1（作者原意"默认开"），但 2026-10-22 用户实测：
 //   手动投料能触发动画、PA 自动投料不能 → 该键仅触发面板重绘，动画/进度条由
@@ -4210,10 +4214,104 @@ static bool PaIsChestModule(const char* module) {
     return module && strcmp(module, "gimmick_chest") == 0;
 }
 
+// ============================================================
+// 2026-11-14【矿洞探针】只读：模块名分布 + 背包新增检测
+// ============================================================
+struct PaModuleTally {
+    char name[48];
+    size_t count;
+};
+static PaModuleTally g_mineTally[96];
+static size_t g_mineTallyCount = 0;
+static ULONGLONG g_mineTallyAt = 0;
+static bool g_mineTallyRound = false;
+
+static void PaMineTallyModule(const char* m) {
+    if (!m || !m[0]) return;
+    for (size_t i = 0; i < g_mineTallyCount; ++i) {
+        if (strcmp(g_mineTally[i].name, m) == 0) {
+            ++g_mineTally[i].count;
+            return;
+        }
+    }
+    if (g_mineTallyCount <
+        sizeof(g_mineTally) / sizeof(g_mineTally[0])) {
+        strncpy_s(g_mineTally[g_mineTallyCount].name,
+                  sizeof(g_mineTally[g_mineTallyCount].name), m, _TRUNCATE);
+        g_mineTally[g_mineTallyCount].count = 1;
+        ++g_mineTallyCount;
+    }
+}
+
+// 挂在 mod_tick：每 500ms 读一次背包，打印本轮新出现 / 数量增加的物品。
+// save+0x32c0 是玩家背包槽数组（与 ChestSort 同源），固定读 30 槽。
+static void PaMineProbeTick() {
+    if (!g_paMineProbe) return;
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_last < 500ULL) return;
+    s_last = now;
+
+    const uintptr_t exe =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* root = nullptr;
+    void* save = nullptr;
+    if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
+        !root || !PaReadPtr(root, PA_SAVE_OFFSET, &save) || !save) return;
+
+    constexpr size_t kSlots = 30;
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) + 0x32c0);
+    if (!NearbyIsReadable(slots, kSlots * sizeof(void*))) return;
+
+    unsigned long long ids[kSlots] = {};
+    int counts[kSlots] = {};
+    for (size_t i = 0; i < kSlots; ++i) {
+        void* item = slots[i];
+        if (!item) continue;
+        NearbyItemInfo info = {};
+        if (!NearbyReadItem(item, &info)) continue;
+        ids[i] = info.itemId;
+        counts[i] = info.stackCount;
+    }
+
+    static unsigned long long s_prevIds[kSlots] = {};
+    static int s_prevCounts[kSlots] = {};
+    static bool s_hasPrev = false;
+    if (s_hasPrev) {
+        for (size_t i = 0; i < kSlots; ++i) {
+            if (!ids[i]) continue;
+            int prev = 0;
+            for (size_t j = 0; j < kSlots; ++j) {
+                if (s_prevIds[j] == ids[i]) {
+                    prev = s_prevCounts[j];
+                    break;
+                }
+            }
+            if (counts[i] > prev) {
+                Log("[PA] mine probe: GAIN item=%llu %d -> %d slot=%zu\n",
+                    ids[i], prev, counts[i], i);
+            }
+        }
+    }
+    memcpy(s_prevIds, ids, sizeof(ids));
+    memcpy(s_prevCounts, counts, sizeof(counts));
+    s_hasPrev = true;
+}
+
 static size_t PaEnumerateGimmicks(void* save) {
     if (!save) return 0;
     size_t count = 0;
     g_rancherCount = 0;  // 探针：每轮重建回收机收集表
+    // 2026-11-14【矿洞探针】每 15 秒统计一轮全场模块名分布。
+    // 复用下面「非机器本来就会读 moduleName」的路径，不额外增加内存读取。
+    g_mineTallyRound = false;
+    if (g_paMineProbe &&
+        GetTickCount64() - g_mineTallyAt >= 15000ULL) {
+        g_mineTallyAt = GetTickCount64();
+        g_mineTallyCount = 0;
+        g_mineTallyRound = true;
+    }
     static bool s_diagDone = false;  // 首次扫描诊断（防刷屏）
 
     // registry head（旧版 L1654-1671: sentinel 在 save+0x3440，
@@ -4313,6 +4411,8 @@ static size_t PaEnumerateGimmicks(void* save) {
                         PaReadGimmickModule(status, module, sizeof(module));
                 }
                 if (moduleRead) isChest = PaIsChestModule(module);
+                if (moduleRead && g_mineTallyRound)
+                    PaMineTallyModule(module);
                 if ((g_paRancherProbe || g_paRancherAuto) && moduleRead) {
                     if (strstr(module, "collection") &&
                         g_rancherCount <
@@ -4401,6 +4501,15 @@ static size_t PaEnumerateGimmicks(void* save) {
             Log("[PA] enum diag: chest[%zu] uid=%llu gid=%llu module=%hs\n",
                 i, static_cast<unsigned long long>(g_entries[i].id.uniqueId),
                 static_cast<unsigned long long>(g_entries[i].gimmickId), mod);
+        }
+    }
+    if (g_mineTallyRound) {
+        Log("[PA] mine probe: MODULE TALLY declared=%llu visited=%zu "
+            "kinds=%zu (non-machine, 15s snapshot)\n",
+            declared, nodesVisited, g_mineTallyCount);
+        for (size_t i = 0; i < g_mineTallyCount; ++i) {
+            Log("[PA] mine probe:   %hs x%zu\n",
+                g_mineTally[i].name, g_mineTally[i].count);
         }
     }
     return count;
@@ -5845,6 +5954,11 @@ static void PaTick(const PaWorldContext* ctx) {
                     wcscat_s(p8, MAX_PATH, L"qol_pa_collection_probe.txt");
                     g_paCollectionProbe =
                         (GetFileAttributesW(p8) != INVALID_FILE_ATTRIBUTES);
+                    wchar_t p9[MAX_PATH] = {};
+                    wcscpy_s(p9, MAX_PATH, dir);
+                    wcscat_s(p9, MAX_PATH, L"qol_pa_mineclear_probe.txt");
+                    g_paMineProbe =
+                        (GetFileAttributesW(p9) != INVALID_FILE_ATTRIBUTES);
                     wchar_t p4[MAX_PATH] = {};
                     wcscpy_s(p4, MAX_PATH, dir);
                     wcscat_s(p4, MAX_PATH, L"qol_pa_nativepush.txt");
@@ -5865,11 +5979,11 @@ static void PaTick(const PaWorldContext* ctx) {
                 }
             }
             Log("[PA] diag flags: pushprobe=%d fasttest=%d dumpkeys=%d "
-                "rancher=%d rancherAuto=%d collection=%d nativepush=%d pushfeed=%d%s "
-                "touchui=%d\n",
+                "rancher=%d rancherAuto=%d collection=%d mine=%d "
+                "nativepush=%d pushfeed=%d%s touchui=%d\n",
                 g_paPushProbe, g_paFastTest, g_paDumpKeys,
                 g_paRancherProbe, g_paRancherAuto, g_paCollectionProbe,
-                g_paNativePushTest,
+                g_paMineProbe, g_paNativePushTest,
                 g_paUsePushFeed,
                 g_paUsePushFeed
                     ? " (feed chain ENABLED)"
