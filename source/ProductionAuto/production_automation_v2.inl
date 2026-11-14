@@ -129,6 +129,10 @@ static volatile int g_paFastTest = 0;
 static volatile int g_paNativePush = 0;
 // v1.5.49-diag：dump 机器 status 两个 map 的全部键值（对比"游戏写"与"PA 写"）
 static volatile int g_paDumpKeys = 0;
+// 2026-11-14【畜产品回收机探针】qol_pa_rancher_probe.txt 存在时开启。
+//   只读诊断：不写任何内存、不动任何物品。用于定位 gimmick_collection_machine
+//   的 status 结构与产出存放位置（它不在配方表也不是箱子，正常枚举会丢弃它）。
+static volatile int g_paRancherProbe = 0;
 // v1.5.53-diag：投料后触碰 UI 同步键（UIManpu+1），触发面板重绘。
 // v1.5.78 尝试：g_paTouchUi=1（作者原意"默认开"），但 2026-10-22 用户实测：
 //   手动投料能触发动画、PA 自动投料不能 → 该键仅触发面板重绘，动画/进度条由
@@ -4119,6 +4123,17 @@ struct PaGimmickEntry {
 static constexpr size_t PA_MAX_ENTRIES = 1024;
 static PaGimmickEntry g_entries[PA_MAX_ENTRIES];
 
+// 2026-11-14【畜产品回收机探针】枚举时单独收集 module 含 "collection" 的
+//   gimmick（畜产品回收机等）。每轮扫描重建，只读。
+struct PaRancherEntry {
+    u64 gid;
+    float x, y, z;
+    void* status;
+    char module[48];
+};
+static PaRancherEntry g_rancherEntries[64];
+static size_t g_rancherCount = 0;
+
 // ============================================================
 // v1.6.7【燃料借用】组内箱子可能有主料却没有燃料
 //   背景（2026-10-29 实测）：高炉 240090100 与面粉机/炭窑同组，
@@ -4189,6 +4204,7 @@ static bool PaIsChestModule(const char* module) {
 static size_t PaEnumerateGimmicks(void* save) {
     if (!save) return 0;
     size_t count = 0;
+    g_rancherCount = 0;  // 探针：每轮重建回收机收集表
     static bool s_diagDone = false;  // 首次扫描诊断（防刷屏）
 
     // registry head（旧版 L1654-1671: sentinel 在 save+0x3440，
@@ -4279,9 +4295,54 @@ static size_t PaEnumerateGimmicks(void* save) {
                 // 不能用"有 items vector"判断——储物罐等容器会误判！
                 bool isChest = false;
                 char module[48] = {};
-                if (!isMachine &&
-                    PaReadGimmickModule(status, module, sizeof(module))) {
-                    isChest = PaIsChestModule(module);
+                // 2026-11-14【畜产品回收机探针】探针开启时对所有 gimmick
+                //   都读模块名（原本只对非机器读）——否则回收机两不沾
+                //   （非配方机器、非箱子）会被静默丢弃，日志连 orphan 都没有。
+                bool moduleRead = false;
+                if (!isMachine || g_paRancherProbe) {
+                    moduleRead =
+                        PaReadGimmickModule(status, module, sizeof(module));
+                }
+                if (moduleRead) isChest = PaIsChestModule(module);
+                if (g_paRancherProbe && moduleRead) {
+                    if (strstr(module, "collection") &&
+                        g_rancherCount <
+                            sizeof(g_rancherEntries) /
+                                sizeof(g_rancherEntries[0])) {
+                        PaRancherEntry& re =
+                            g_rancherEntries[g_rancherCount++];
+                        re.gid = gimmickId;
+                        re.x = x;
+                        re.y = y;
+                        re.z = z;
+                        re.status = status;
+                        strncpy_s(re.module, sizeof(re.module), module,
+                                  _TRUNCATE);
+                    } else if (!isChest && !isMachine) {
+                        // 未知模块名各记录一次（最多 32 种），只读。
+                        static char s_seenModules[32][48] = {};
+                        static size_t s_seenModuleCount = 0;
+                        bool seenModule = false;
+                        for (size_t q = 0; q < s_seenModuleCount; ++q) {
+                            if (strcmp(s_seenModules[q], module) == 0) {
+                                seenModule = true;
+                                break;
+                            }
+                        }
+                        if (!seenModule &&
+                            s_seenModuleCount <
+                                sizeof(s_seenModules) /
+                                    sizeof(s_seenModules[0])) {
+                            strcpy_s(
+                                s_seenModules[s_seenModuleCount++],
+                                sizeof(s_seenModules[0]), module);
+                            Log("[PA] rancher probe: other module=%hs "
+                                "gid=%llu pos=(%.0f,%.0f)\n",
+                                module,
+                                static_cast<unsigned long long>(gimmickId),
+                                x, y);
+                        }
+                    }
                 }
                 if (isMachine || isChest) {
                     g_entries[count].id = id;
@@ -5483,6 +5544,11 @@ static void PaTick(const PaWorldContext* ctx) {
                     wcscat_s(p3, MAX_PATH, L"qol_pa_dumpkeys.txt");
                     g_paDumpKeys =
                         (GetFileAttributesW(p3) != INVALID_FILE_ATTRIBUTES);
+                    wchar_t p5[MAX_PATH] = {};
+                    wcscpy_s(p5, MAX_PATH, dir);
+                    wcscat_s(p5, MAX_PATH, L"qol_pa_rancher_probe.txt");
+                    g_paRancherProbe =
+                        (GetFileAttributesW(p5) != INVALID_FILE_ATTRIBUTES);
                     wchar_t p4[MAX_PATH] = {};
                     wcscpy_s(p4, MAX_PATH, dir);
                     wcscat_s(p4, MAX_PATH, L"qol_pa_nativepush.txt");
@@ -5503,9 +5569,9 @@ static void PaTick(const PaWorldContext* ctx) {
                 }
             }
             Log("[PA] diag flags: pushprobe=%d fasttest=%d dumpkeys=%d "
-                "nativepush=%d pushfeed=%d%s touchui=%d\n",
+                "rancher=%d nativepush=%d pushfeed=%d%s touchui=%d\n",
                 g_paPushProbe, g_paFastTest, g_paDumpKeys,
-                g_paNativePushTest, g_paUsePushFeed,
+                g_paRancherProbe, g_paNativePushTest, g_paUsePushFeed,
                 g_paUsePushFeed
                     ? " (feed chain ENABLED)"
                     : " (DISABLED by qol_pa_pushfeed_off.txt)",
@@ -5561,6 +5627,86 @@ static void PaTick(const PaWorldContext* ctx) {
     const size_t entryCount = PaEnumerateGimmicks(ctx->save);
     PaBuildGroups(entryCount);
     Log("[PA] scan: entries=%zu groups=%zu\n", entryCount, g_groupCount);
+
+    // 2026-11-14【畜产品回收机探针】只读诊断块：
+    //   ① 每轮打印可见机器/箱子/回收机计数；箱子集合变化时全量列出
+    //     （回答「人在畜舍时其它地图/房间的箱子是否在内存里」）；
+    //   ② 每 15 秒 dump 每台回收机的两张 status map（0x18 int / 0x58 u64）
+    //     + 按箱子同款路径尝试读 items vector（定位产出存放处）；
+    //   ③ 绝不写任何内存、不增减任何物品。
+    if (g_paRancherProbe) {
+        size_t probeChestTotal = 0;
+        u64 probeChestHash = 1469598103934665603ull;
+        for (size_t j = 0; j < entryCount; ++j) {
+            if (!g_entries[j].isChest) continue;
+            ++probeChestTotal;
+            const u64 mix =
+                (g_entries[j].gimmickId * 1000003ull) ^
+                (static_cast<u64>(static_cast<int>(g_entries[j].x))
+                 << 20) ^
+                static_cast<u64>(static_cast<int>(g_entries[j].y));
+            probeChestHash = (probeChestHash ^ mix) * 1099511628211ull;
+        }
+        Log("[PA] rancher probe: entries=%zu chests=%zu collectors=%zu\n",
+            entryCount, probeChestTotal, g_rancherCount);
+        static u64 s_probeLastChestHash = 0;
+        if (probeChestHash != s_probeLastChestHash) {
+            s_probeLastChestHash = probeChestHash;
+            for (size_t j = 0; j < entryCount; ++j) {
+                if (!g_entries[j].isChest) continue;
+                Log("[PA] rancher probe: chest uid=%llu gid=%llu "
+                    "pos=(%.0f,%.0f)\n",
+                    static_cast<unsigned long long>(
+                        g_entries[j].id.uniqueId),
+                    static_cast<unsigned long long>(
+                        g_entries[j].gimmickId),
+                    g_entries[j].x, g_entries[j].y);
+            }
+            for (size_t j = 0; j < g_rancherCount; ++j) {
+                const PaRancherEntry& re = g_rancherEntries[j];
+                Log("[PA] rancher probe: collector gid=%llu module=%hs "
+                    "pos=(%.0f,%.0f) status=%p\n",
+                    static_cast<unsigned long long>(re.gid), re.module,
+                    re.x, re.y, re.status);
+            }
+        }
+        static ULONGLONG s_probeLastDetail = 0;
+        if (g_rancherCount && now - s_probeLastDetail >= 15000) {
+            s_probeLastDetail = now;
+            for (size_t j = 0; j < g_rancherCount; ++j) {
+                const PaRancherEntry& re = g_rancherEntries[j];
+                Log("[PA] rancher probe: --- dump collector gid=%llu ---\n",
+                    static_cast<unsigned long long>(re.gid));
+                PaDumpStatusMap(re.status, 0x18, true, re.gid);
+                PaDumpStatusMap(re.status, 0x58, false, re.gid);
+                NearbyRawPointerVector probeInv = {};
+                if (NearbyReadRawInventoryRelaxed(re.status, &probeInv)) {
+                    const size_t probeSlots =
+                        (reinterpret_cast<uintptr_t>(probeInv.end) -
+                         reinterpret_cast<uintptr_t>(probeInv.begin)) /
+                        sizeof(void*);
+                    Log("[PA] rancher probe: items vector slots=%zu\n",
+                        probeSlots);
+                    for (size_t s = 0; s < probeSlots; ++s) {
+                        void* probeItem = probeInv.begin[s];
+                        if (!probeItem) continue;
+                        NearbyItemInfo probeInfo = {};
+                        if (NearbyReadItem(probeItem, &probeInfo)) {
+                            Log("[PA] rancher probe:   slot=%zu "
+                                "item=%llu x%d\n",
+                                s,
+                                static_cast<unsigned long long>(
+                                    probeInfo.itemId),
+                                probeInfo.stackCount);
+                        }
+                    }
+                } else {
+                    Log("[PA] rancher probe: (no readable items vector "
+                        "at NEARBY_STATUS_ITEMS_OFFSET)\n");
+                }
+            }
+        }
+    }
 
     // v1.5.21：组构成 + 孤立机器，**按拓扑变化重打**（箱子/机器动了就重出）
     //   旧版一次性打印 → 玩家中途挪箱子看不到新结果，误以为"箱子在隔壁却没连"。
