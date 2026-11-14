@@ -5127,6 +5127,7 @@ static void PaMineYieldPollConfig() {
         if (strncmp(p, "probe", 5) == 0) mode = 1;
         else if (strncmp(p, "yield", 5) == 0) mode = 2;
         else if (strncmp(p, "scan", 4) == 0) mode = 3;
+        else if (strncmp(p, "vec", 3) == 0) mode = 4;
     }
     InterlockedExchange(&g_myMode, mode);
 
@@ -5344,11 +5345,12 @@ static void PaMyRefresh() {
 
 // 浮层提示单独 noinline：payout 内含 __try/__except，若把 obs.h 的 inline
 // obsPush/EventF 内联进来，MSVC 可能报 C2712（SEH 与对象展开冲突）。
-__declspec(noinline) static void PaMyToastPayout(int added, int created,
+__declspec(noinline) static void PaMyToastPayout(unsigned int layerRem,
+                                                 int added, int created,
                                                  int merged) {
     qol::obs::EventF(1, qol::obs::OBS_TOAST_MS,
-        L"[矿洞] 整层产出 %d 件矿石已直接入包（新堆 %d / 叠加 %d）",
-        added, created, merged);
+        L"[矿洞] 本层 %u 块 -> 收到 %d 件原矿（新堆 %d / 叠加 %d）",
+        layerRem, added, created, merged);
 }
 
 // 引擎侧物化三件套是否已由 InstallProductionAutomation() 绑定（无条件绑定）。
@@ -5422,30 +5424,34 @@ static void PaMineYieldPayout(void* save, unsigned int layerRem,
     const size_t n = PaMyCollectStacks(save);
     // 白名单来源仍是运行时库存（背包 + 箱子）里的矿石 itemId 区间，
     // 也可在 qol_pa_mineyield.txt 用 ids= 精确指定。
+    // 第十一轮实测：230000~240050 是木头/种子，不是矿石。
+    // 权威原矿 ID 由 processing_recipe_table.inl 的熔炉配方 +
+    // production_hud_v2.inl 的物品名表双重印证，固定 8 种；
+    // 仍可用 ids= 覆盖（例如只想收铜/铁：ids=130020,130040）。
+    static const unsigned long long kOreIds[8] = {
+        130000ULL, 130020ULL, 130040ULL, 130060ULL,
+        130080ULL, 130100ULL, 130120ULL, 130140ULL
+    };
     unsigned long long ids[16] = {};
     long idCount = g_myIdCount;
     if (idCount > 0) {
         for (long i = 0; i < idCount; ++i) ids[i] = g_myIds[i];
     } else {
-        for (size_t i = 0; i < n && idCount < 16; ++i) {
-            const unsigned long long id = g_myStacks[i].id;
-            if (id < g_myLo || id >= g_myHi) continue;
-            int dup = 0;
-            for (long k = 0; k < idCount; ++k) {
-                if (ids[k] == id) { dup = 1; break; }
-            }
-            if (!dup) ids[idCount++] = id;
-        }
+        for (long i = 0; i < 8; ++i) ids[i] = kOreIds[i];
+        idCount = 8;
     }
     if (idCount <= 0) {
         Log("[PA] mine yield: NO ore ids (set ids= in config), skip\n");
         return;
     }
 
+    // 总量 = 本层剩余石头数 x 每块产出份数（默认 1 份/块），
+    // 不再 rem*8/16 那种与本层无关的放大均分。
     long per = g_myPer;
     if (per < 1) per = 1;
+    if (per > 20) per = 20;
     long cap = g_myCap;
-    if (cap < 1) cap = 300;
+    if (cap < 1) cap = 999;
     long long total = static_cast<long long>(layerRem) * per;
     if (total > cap) total = cap;
     long long eachLL = total / idCount;
@@ -5473,9 +5479,12 @@ static void PaMineYieldPayout(void* save, unsigned int layerRem,
     int created = 0;
     int skipped = 0;
     bool stop = false;
+    // 47 块 / 8 种 = 每种 5 余 7：把余数分摊到前 7 种，
+    // 保证本轮发放总量精确等于本层剩余石头数，不丢也不多。
+    const long long remainder = total % idCount;
     for (long k = 0; k < idCount && !stop; ++k) {
         const unsigned long long id = ids[k];
-        int want = each;
+        int want = each + (k < remainder ? 1 : 0);
 
         // a) 先叠加到背包里已有的同类堆（不占新槽）
         for (size_t i = 0; i < n && want > 0; ++i) {
@@ -5539,7 +5548,7 @@ static void PaMineYieldPayout(void* save, unsigned int layerRem,
 
     if (added > 0) {
         PaMyRefresh();
-        PaMyToastPayout(added, created, merged);
+        PaMyToastPayout(layerRem, added, created, merged);
     }
     Log("[PA] mine yield: payout layer=%u rem=%u ids=%ld per=%ld "
         "added=%d new=%d merge=%d skip=%d%s\n",
@@ -5667,6 +5676,77 @@ static void PaMyScanLevel(void* save, unsigned int floor,
     }
 }
 
+// ============================================================
+// 2026-11-15【矿洞第十二轮·本层对象 vector 只读探针】
+// 第十一轮发现 +0xD0~+0x188 的 24 个对象是静态地图配置（跨层逐字节相同），
+// 但 level+0x40 / +0x58 两组 std::vector 在「进层」时生成、count 随 rem
+// 变化（rem=56 -> 71、rem=47 -> 59），最可能是本层对象列表。
+// 本探针只读，零写入、零 hook、不改 rem、不发放任何物品。
+// ============================================================
+static void PaMyVecDump(void* save, unsigned int floor, unsigned int rem) {
+    static unsigned int s_floor = 0xFFFFFFFFu;
+    static unsigned int s_rem = 0xFFFFFFFFu;
+    const bool enter = (floor != s_floor);
+    const bool hit = (!enter && s_rem != 0xFFFFFFFFu && rem < s_rem);
+    s_floor = floor;
+    s_rem = rem;
+    if (!enter && !hit) return;
+
+    void* lvl = PaMyReadLevelObj(save);
+    if (!lvl) return;
+    unsigned char* b = reinterpret_cast<unsigned char*>(lvl);
+    if (!NearbyIsReadable(b, 0xA0)) return;
+    unsigned char snap[0xA0] = {};
+    int snapOk = 0;
+    __try { memcpy(snap, b, 0xA0); snapOk = 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { snapOk = 0; }
+    if (!snapOk) return;
+
+    Log("[PA] mine vec: %s layer=%u rem=%u lvl=%p\n",
+        enter ? "ENTER" : "HIT", floor, rem, lvl);
+    const int offs[4] = { 0x40, 0x58, 0x70, 0x88 };
+    for (int vi = 0; vi < 4; ++vi) {
+        void** begin = *reinterpret_cast<void***>(snap + offs[vi]);
+        void** end = *reinterpret_cast<void***>(snap + offs[vi] + 8);
+        size_t cnt = 0;
+        if (end > begin) cnt = static_cast<size_t>(end - begin);
+        const size_t show = (cnt > 80) ? 80 : cnt;
+        Log("[PA] mine vec: VEC +%03X begin=%p end=%p count=%zu show=%zu\n",
+            offs[vi], begin, end, cnt, show);
+        if (!show || !NearbyIsReadable(begin, show * sizeof(void*))) continue;
+
+        for (size_t i = 0; i < show; i += 4) {
+            unsigned long long v[4] = {};
+            int rok = 0;
+            __try {
+                for (size_t j = 0; j < 4 && i + j < show; ++j)
+                    v[j] = reinterpret_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(begin[i + j]));
+                rok = 1;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { rok = 0; }
+            if (!rok) break;
+            Log("[PA] mine vec:   [%02zu] %016llX %016llX %016llX %016llX\n",
+                i, v[0], v[1], v[2], v[3]);
+        }
+
+        int dumped = 0;
+        for (size_t i = 0; i < show && dumped < 3; ++i) {
+            void* e = begin[i];
+            if (!e || reinterpret_cast<uintptr_t>(e) < 0x10000) continue;
+            if (!NearbyIsReadable(e, 0x40)) continue;
+            unsigned long long v[8] = {};
+            int eok = 0;
+            __try { memcpy(v, e, 0x40); eok = 1; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { eok = 0; }
+            if (!eok) continue;
+            Log("[PA] mine vec:   OBJ[%zu]=%p | %016llX %016llX %016llX "
+                "%016llX | %016llX %016llX %016llX %016llX\n",
+                i, e, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            ++dumped;
+        }
+    }
+}
+
 static void PaMineYieldTick() {
     PaMineYieldPollConfig();
     const long mode = g_myMode;
@@ -5699,6 +5779,10 @@ static void PaMineYieldTick() {
     if (mode == 3) {
         PaMyScanGain(save, floor, rem);
         PaMyScanLevel(save, floor, rem);
+        return;
+    }
+    if (mode == 4) {
+        PaMyVecDump(save, floor, rem);
         return;
     }
     if (mode != 2) return;
