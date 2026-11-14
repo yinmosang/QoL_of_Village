@@ -4244,6 +4244,112 @@ static void PaMineTallyModule(const char* m) {
 }
 
 // ============================================================
+// 2026-11-14【矿洞 hook 探针·第四轮】被动记录 HarvestSettle
+// 开关 qol_pa_minehook.txt 存在才安装；删掉则完全不挂钩。
+// 目标 RVA 0x220470：序言 48 89 5C 24 10 恰为一条完整 5 字节指令。
+// detour 只记录不干预；trampoline 可多次调用原函数，供后续「整层清场」复用。
+// ============================================================
+using PaHarvestSettleFn = void(__fastcall*)(void*);
+using PaCaptureStackFn = USHORT(WINAPI*)(ULONG, ULONG, PVOID*, PULONG);
+static PaHarvestSettleFn g_mineHookOrig = nullptr;
+static PaCaptureStackFn g_paCaptureStack = nullptr;
+static volatile int g_paMineHook = 0;
+static unsigned long long g_mineLastLandId = 0;
+static void* g_mineLastState = nullptr;
+
+static unsigned int PaMineReadRem() {
+    const uintptr_t exe =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* root = nullptr;
+    void* save = nullptr;
+    void* lvl = nullptr;
+    if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
+        !root || !PaReadPtr(root, PA_SAVE_OFFSET, &save) || !save ||
+        !PaReadPtr(save, 0x34E8, &lvl) || !lvl) return 0;
+    unsigned int rem = 0;
+    __try {
+        rem = *reinterpret_cast<const unsigned int*>(
+            reinterpret_cast<unsigned char*>(lvl) + 0x3C);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return rem;
+}
+
+static void __fastcall PaMineSettleDetour(void* state) {
+    if (g_paMineHook && state) {
+        unsigned long long landId = 0;
+        __try {
+            landId = *reinterpret_cast<const unsigned long long*>(
+                reinterpret_cast<unsigned char*>(state) + 0x248);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            landId = 0;
+        }
+        if (landId != g_mineLastLandId || state != g_mineLastState) {
+            g_mineLastLandId = landId;
+            g_mineLastState = state;
+            Log("[PA] mine hook: state=%p landId=0x%llX rem=%u\n",
+                state, landId, PaMineReadRem());
+            static int s_stackDumps = 0;
+            if (g_paCaptureStack && s_stackDumps < 6) {
+                ++s_stackDumps;
+                PVOID frames[10] = {};
+                ULONG hash = 0;
+                USHORT n = g_paCaptureStack(0, 10, frames, &hash);
+                const uintptr_t exe =
+                    reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                for (USHORT i = 0; i < n && i < 10; ++i) {
+                    const unsigned long long rva =
+                        static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(frames[i]) - exe);
+                    Log("[PA] mine hook:   frame[%u]=0x%llX\n",
+                        static_cast<unsigned>(i), rva);
+                }
+            }
+        }
+    }
+    if (g_mineHookOrig) g_mineHookOrig(state);
+}
+
+static void PaInstallMineHook() {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    wcscat_s(path, MAX_PATH, L"qol_pa_minehook.txt");
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
+
+    const uintptr_t base =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    unsigned char* target =
+        reinterpret_cast<unsigned char*>(base + 0x220470);
+    // 项目实证：5 字节 hook 若截断序言会崩游戏 —— 不匹配就拒绝安装。
+    static const unsigned char kPrologue[5] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10};
+    if (memcmp(target, kPrologue, sizeof(kPrologue)) != 0) {
+        Log("[PA] mine hook: prologue MISMATCH, NOT installed\n");
+        return;
+    }
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) {
+        g_paCaptureStack = reinterpret_cast<PaCaptureStackFn>(
+            GetProcAddress(ntdll, "RtlCaptureStackBackTrace"));
+    }
+    const bool ok = qol::HookInstall(
+        reinterpret_cast<uintptr_t>(target),
+        reinterpret_cast<uintptr_t>(&PaMineSettleDetour),
+        reinterpret_cast<uintptr_t*>(&g_mineHookOrig));
+    g_paMineHook = ok ? 1 : 0;
+    Log("[PA] mine hook: install=%d stack=%d\n",
+        ok ? 1 : 0, g_paCaptureStack ? 1 : 0);
+}
+
+// ============================================================
 // 2026-11-14【矿洞 level 探针·第二轮】只读 dump save+0x34E8
 // 目标：定位本层石头对象数组，为「整层清场」提供 landID 来源。
 // ============================================================
