@@ -73,6 +73,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include <wchar.h>   // 2026-11-14 跨箱回收：wcsrchr / wcscpy_s / wcscat_s
 #pragma comment(lib, "winmm.lib")  // joyGetPosEx
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
@@ -291,6 +292,15 @@ static DWORD WINAPI HidPollThread(LPVOID);         // 前向声明（定义在 G
 
 // ---- 共享热键（游戏内改键链路）：默认 "4, D-pad Up"，qol_hotkeys.txt 覆盖 ----
 static QolHotKeys g_hotkeys;
+
+// 2026-11-14【跨箱回收】全场箱子模式
+//   qol_chestsort_global.txt 存在时启用；文件内容可写热键名（默认 F7）。
+//   启用后新增一个独立热键，把背包同类物品并入【全场所有箱子】的同类堆，
+//   不再受 720 半径限制，因此站在畜舍/别的地图/箱子界面里都能用。
+//   原有按 4 / D-pad Up 的「附近归类」行为完全不变。
+static volatile int g_csGlobalEnabled = 0;   // 开关（每 500ms 检查文件）
+static volatile int g_csGlobalActive = 0;    // 本次 DoSort 走全场分支
+static WORD         g_csGlobalVk = VK_F7;    // 独立热键，默认 F7
 
 // ============================================================
 // 全局状态
@@ -846,6 +856,85 @@ static void ProcessRegistryChunk() {
     }
 }
 
+// 2026-11-14【跨箱回收】全场注册表扫描
+//   root+0x208 在 ProductionAuto 里叫 save，在 ChestSort 里叫 player —— 是
+//   同一个指针。save+0x3448 是 gimmick 链表 sentinel，紧随其后 8 字节是
+//   declared 数量；链表节点 +0=next / +8=prev / +0x10=status。
+//   ProductionAuto 用同一条链路实测一次枚举到 273 个 gimmick / 35 个箱子，
+//   覆盖跨房间跨地图，完全不依赖当前地图的 spatialIndex。
+static void StartGlobalRegistryScan(const WorldContext* ctx) {
+    if (!ctx || !ctx->player) return;
+    FastRegionReset();
+    // 若启动预热的分片扫描还没跑完就按了 F7，先释放那份待处理向量，
+    // 避免它被静默丢弃（一次几十字节，但不留隐患）。
+    if (G::scanPending) {
+        ReleaseSearchVector(&G::pendingResults);
+        G::scanPending = false;
+    }
+    G::registryCount = 0;
+    G::registryValid = false;
+    G::scanPending = false;   // 不走 spatialSearch 分片路径
+
+    constexpr uintptr_t kGimmickList = 0x3448;  // build 25640656
+    void* sentinel = nullptr;
+    if (!ReadPtr(ctx->player, kGimmickList, &sentinel) || !sentinel) {
+        Log("[ChestSort] [global] gimmick list sentinel 读取失败");
+        return;
+    }
+    const unsigned char* saveBytes =
+        reinterpret_cast<const unsigned char*>(ctx->player);
+    if (!IsReadable(saveBytes + kGimmickList + sizeof(void*),
+                    sizeof(unsigned long long))) {
+        Log("[ChestSort] [global] declared 字段不可读");
+        return;
+    }
+    const unsigned long long declared =
+        *reinterpret_cast<const unsigned long long*>(
+            saveBytes + kGimmickList + sizeof(void*));
+    if (declared == 0 || declared > 4096) {
+        Log("[ChestSort] [global] declared 异常: %llu", declared);
+        return;
+    }
+
+    void* node = *reinterpret_cast<void**>(sentinel);
+    void* previous = sentinel;
+    size_t visited = 0;
+    for (unsigned long long i = 0;
+         i < declared && G::registryCount < MAX_REGISTRY; ++i) {
+        if (!node || node == sentinel ||
+            !IsReadable(node, sizeof(void*) * 3)) break;
+        if (*reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(node) + sizeof(void*)) !=
+            previous) break;  // prev 链校验，防止野指针跑飞
+        void* status = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(node) + sizeof(void*) * 2);
+        previous = node;
+        node = *reinterpret_cast<void**>(node);
+        ++visited;
+
+        if (!status || !IsChestStatus(status)) continue;
+        const float* pos = reinterpret_cast<const float*>(
+            reinterpret_cast<unsigned char*>(status) +
+            GIMMICK_POSITION_OFFSET);
+        if (!IsReadable(pos, sizeof(float) * 4)) continue;
+        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1])) continue;
+
+        bool dup = false;
+        for (size_t j = 0; j < G::registryCount; ++j) {
+            if (G::registry[j].status == status) { dup = true; break; }
+        }
+        if (dup) continue;
+        G::registry[G::registryCount] = { status, pos[0], pos[1] };
+        ++G::registryCount;
+    }
+
+    G::registryValid = true;
+    G::lastSearchX = ctx->position[0];
+    G::lastSearchY = ctx->position[1];
+    Log("[ChestSort] [global] 全场扫描: visited=%zu chests=%zu declared=%llu",
+        visited, G::registryCount, declared);
+}
+
 // 从注册表中按坐标过滤附近的箱子，实时读取物品
 static void BuildWorkCache(const WorldContext* ctx) {
     FastRegionReset();  // 批量扫描前重置区域缓存
@@ -854,7 +943,8 @@ static void BuildWorkCache(const WorldContext* ctx) {
         float dx = G::registry[i].posX - ctx->position[0];
         float dy = G::registry[i].posY - ctx->position[1];
         float distSq = dx * dx + dy * dy;
-        if (distSq > SORT_RADIUS_SQ) continue;
+        // 全场模式不再按距离裁掉别的房间/地图的箱子
+        if (!g_csGlobalActive && distSq > SORT_RADIUS_SQ) continue;
 
         CachedChest& cc = G::cachedChests[G::cachedChestCount];
         cc.status = G::registry[i].status;
@@ -1227,7 +1317,12 @@ static void DoSort(WorldContext* ctx) {
     // === 第一步：注册表增量更新 ===
     // 走到新区域（离上次搜索中心>720）才补搜，已搜过的不重复。
     // 搜索立即返回（spatialSearch ~0ms），过滤在 mod_tick 分片完成。
-    if (!G::scanPending) {
+    // 2026-11-14【跨箱回收】全场模式走存档 gimmick 链表，每次触发都重扫一遍
+    //   （箱子可能被挪动/新增），并强制重建工作缓存以保证箱内数量是最新的。
+    if (g_csGlobalActive) {
+        StartGlobalRegistryScan(ctx);
+        G::workCacheValid = false;
+    } else if (!G::scanPending) {
         if (!G::registryValid) {
             StartRegistryScan(ctx);
         } else {
@@ -1648,12 +1743,98 @@ static void DoSort(WorldContext* ctx) {
 }
 
 // ============================================================
+// 2026-11-14【跨箱回收】开关与独立热键
+// ============================================================
+static WORD ParseCsGlobalVk(const char* s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') ++s;
+    if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '1' && s[1] <= '9') {
+        int n = s[1] - '0';
+        if (n == 1 && s[2] >= '0' && s[2] <= '2') n = 10 + (s[2] - '0');
+        if (n >= 1 && n <= 12) return static_cast<WORD>(VK_F1 + n - 1);
+    }
+    if (s[0] >= '0' && s[0] <= '9') return static_cast<WORD>(s[0]);
+    if (s[0] >= 'A' && s[0] <= 'Z') return static_cast<WORD>(s[0]);
+    if (s[0] >= 'a' && s[0] <= 'z')
+        return static_cast<WORD>(s[0] - 'a' + 'A');
+    return VK_F7;
+}
+
+// 每 500ms 检查开关文件；存在即启用，文件内容可选写热键名（F7/F8/.../数字/字母）
+static void PollCsGlobalConfig() {
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_last < 500ULL) return;
+    s_last = now;
+
+    wchar_t dir[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, dir, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(dir, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    wchar_t path[MAX_PATH] = {};
+    wcscpy_s(path, MAX_PATH, dir);
+    wcscat_s(path, MAX_PATH, L"qol_chestsort_global.txt");
+
+    const int enabled =
+        (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+    WORD vk = VK_F7;
+    if (enabled) {
+        HANDLE h = CreateFileW(path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            char buf[32] = {};
+            DWORD got = 0;
+            if (ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr)) {
+                buf[got] = 0;
+                vk = ParseCsGlobalVk(buf);
+            }
+            CloseHandle(h);
+        }
+    }
+    if (enabled != g_csGlobalEnabled || vk != g_csGlobalVk) {
+        Log("[ChestSort] [global] config: enabled=%d key=0x%X", enabled,
+            static_cast<unsigned>(vk));
+        g_csGlobalEnabled = enabled;
+        g_csGlobalVk = vk;
+    }
+}
+
+// ============================================================
 // 输入轮询（mod_tick 中调用）
 // ============================================================
 static void PollInput() {
     // 触发方式：
     //   1. 手柄 D-pad Up (XInput > HID > joyGetPosEx 三路混合)
     //   2. 键盘热键（默认数字键 4，由 qol_hotkeys.txt 覆盖，游戏内可改键）
+    //   3. 2026-11-14 全场跨箱收纳独立热键（默认 F7，开关文件控制）
+
+    // ---- 全场跨箱收纳（独立于原生 4，不与其竞争）----
+    PollCsGlobalConfig();
+    if (g_csGlobalEnabled) {
+        static bool s_globNeedsRelease = true;
+        const bool down =
+            (GetAsyncKeyState(g_csGlobalVk) & 0x8000) != 0;
+        bool pressed = false;
+        if (s_globNeedsRelease) {
+            if (!down) s_globNeedsRelease = false;
+        } else if (down) {
+            pressed = true;
+            s_globNeedsRelease = true;
+        }
+        if (pressed) {
+            Log("[ChestSort] ★ 全场跨箱收纳 VK=0x%X",
+                static_cast<unsigned>(g_csGlobalVk));
+            WorldContext ctx = {};
+            if (GetWorldContext(&ctx)) {
+                g_csGlobalActive = 1;
+                DoSort(&ctx);
+                g_csGlobalActive = 0;
+            } else {
+                Log("[ChestSort] 全场模式: 无法获取世界上下文");
+            }
+        }
+    }
 
     // ---- 手柄 D-pad Up ----
     // 手柄三路混合方案，CheckDpadUpPressed 内部自动选择路径
