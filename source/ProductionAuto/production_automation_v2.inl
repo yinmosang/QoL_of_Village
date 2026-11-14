@@ -5044,7 +5044,12 @@ static volatile long g_myCap = 300;
 static unsigned long long g_myLo = 230000;
 static unsigned long long g_myHi = 250000;
 static unsigned long long g_myIds[16] = {};
+static long g_myIdMul[16] = {};          // 0 = 用全局 mul；>0 = 该 id 专用倍率
 static volatile long g_myIdCount = 0;
+static volatile long g_myMul = 3;         // 【第十六轮】掉落放大倍率
+static unsigned long long g_myExIds[16] = {};   // 宽模式排除表
+static volatile long g_myExCount = 0;
+static volatile long g_myWindow = 30000;        // 挥镐后有效窗口(ms)，0=不限
 
 struct PaMyStack {
     unsigned long long id;
@@ -5129,6 +5134,7 @@ static void PaMineYieldPollConfig() {
         else if (strncmp(p, "scan", 4) == 0) mode = 3;
         else if (strncmp(p, "vec", 3) == 0) mode = 4;
         else if (strncmp(p, "ptr", 3) == 0) mode = 5;
+        else if (strncmp(p, "boost", 5) == 0) mode = 6;
     }
     InterlockedExchange(&g_myMode, mode);
 
@@ -5136,6 +5142,8 @@ static void PaMineYieldPollConfig() {
     if (p) InterlockedExchange(&g_myPer, static_cast<long>(PaMyParseU64(p + 4)));
     p = PaMyFind(buf, "cap=");
     if (p) InterlockedExchange(&g_myCap, static_cast<long>(PaMyParseU64(p + 4)));
+    p = PaMyFind(buf, "mul=");
+    if (p) InterlockedExchange(&g_myMul, static_cast<long>(PaMyParseU64(p + 4)));
     p = PaMyFind(buf, "lo=");
     if (p) g_myLo = PaMyParseU64(p + 3);
     p = PaMyFind(buf, "hi=");
@@ -5153,17 +5161,50 @@ static void PaMineYieldPollConfig() {
                 v = v * 10ULL + static_cast<unsigned>(*p - '0');
                 ++p;
             }
-            g_myIds[n++] = v;
+            g_myIds[n] = v;
+            long perMul = 0;
+            if (*p == '@') {
+                ++p;
+                while (*p >= '0' && *p <= '9') {
+                    perMul = perMul * 10 + (*p - '0');
+                    ++p;
+                }
+            }
+            g_myIdMul[n] = perMul;
+            ++n;
         }
     }
     g_myIdCount = n;
 
+    // 宽模式排除表：exclude=123,456
+    long xn = 0;
+    p = PaMyFind(buf, "exclude=");
+    if (p) {
+        p += 8;
+        while (*p && xn < 16) {
+            while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+            if (*p < '0' || *p > '9') break;
+            unsigned long long v = 0;
+            while (*p >= '0' && *p <= '9') {
+                v = v * 10ULL + static_cast<unsigned>(*p - '0');
+                ++p;
+            }
+            g_myExIds[xn++] = v;
+        }
+    }
+    g_myExCount = xn;
+    p = PaMyFind(buf, "window=");
+    if (p) InterlockedExchange(&g_myWindow,
+        static_cast<long>(PaMyParseU64(p + 7)));
+
     static long s_lastMode = -1;
     if (mode != s_lastMode) {
         s_lastMode = mode;
-        Log("[PA] mine yield: config mode=%ld ids=%ld per=%ld cap=%ld "
-            "lo=%llu hi=%llu\n", mode, n, static_cast<long>(g_myPer),
-            static_cast<long>(g_myCap), g_myLo, g_myHi);
+        Log("[PA] mine yield: config mode=%ld ids=%ld ex=%ld per=%ld "
+            "cap=%ld mul=%ld win=%ld lo=%llu hi=%llu\n",
+            mode, n, xn, static_cast<long>(g_myPer),
+            static_cast<long>(g_myCap), static_cast<long>(g_myMul),
+            static_cast<long>(g_myWindow), g_myLo, g_myHi);
     }
 }
 
@@ -5918,13 +5959,186 @@ static void PaMyPtrProbe(void* save, unsigned int floor, unsigned int rem) {
     }
 }
 
+// ============================================================
+// 2026-11-15【矿洞第十六轮·真实掉落放大器】mode=boost (6)
+//
+// 第十五轮事故教训：静态名称表 / 配方表里的 130000~130140 在运行时
+// 其实是畜产品，凭空构造物品堆会灌一背包杂物。本轮彻底不构造任何
+// 物品对象、不猜测 itemId，只做一件事：
+//   逐槽比对背包 -> 发现「游戏自己掉进来的增量」-> 按倍率补 stackCount。
+// 发什么完全由游戏原生掉落决定，因此不可能出现陌生物品。
+// ids= 为空时纯记录（SEEN 日志带出真实 id 与名称表中文名），零写入。
+// 只在 floor>0 生效，农作物 / 日常整理背包完全不受影响。
+// ============================================================
+static void PaMyBoostTick(void* save, unsigned int floor,
+                          unsigned int rem) {
+    static unsigned long long s_ids[30] = {};
+    static int s_counts[30] = {};
+    static bool s_has = false;
+    static unsigned int s_floor = 0;
+    static unsigned int s_prevRem = 0;
+    static unsigned long long s_lastHitAt = 0;
+
+    // 挥镐检测（rem 下降）：只在挥镐后的时间窗内放大，
+    // 避免整理背包 / 从箱子取物被误当成掉落。
+    const bool layerChanged = (floor != s_floor);
+    if (!layerChanged && s_prevRem > 0 && rem < s_prevRem) {
+        s_lastHitAt = GetTickCount64();
+        Log("[PA] mine boost: HIT layer=%u rem=%u->%u\n",
+            floor, s_prevRem, rem);
+    }
+    // 换层 / 离开矿洞：重建基线，避免把「进层时整包变化」误判为掉落。
+    if (layerChanged) {
+        s_floor = floor;
+        s_has = false;
+        s_prevRem = 0;
+    }
+    s_prevRem = rem;
+
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) +
+        NEARBY_PLAYER_ITEMS_OFFSET);
+    if (!NearbyIsReadable(slots, 30 * sizeof(void*))) return;
+
+    unsigned long long ids[30] = {};
+    int counts[30] = {};
+    void* items[30] = {};
+    for (int i = 0; i < 30; ++i) {
+        void* item = slots[i];
+        if (!item) continue;
+        NearbyItemInfo info = {};
+        if (!NearbyReadItem(item, &info)) continue;
+        ids[i] = info.itemId;
+        counts[i] = info.stackCount;
+        items[i] = item;
+    }
+    if (!s_has) {
+        memcpy(s_ids, ids, sizeof(ids));
+        memcpy(s_counts, counts, sizeof(counts));
+        s_has = true;
+        return;                                  // 第一帧只建立基线
+    }
+
+    long globalMul = static_cast<long>(g_myMul);
+    if (globalMul < 2) globalMul = 2;
+    if (globalMul > 20) globalMul = 20;
+    const long idCount = static_cast<long>(g_myIdCount);
+    long capL = static_cast<long>(g_myCap);
+    if (capL < 1) capL = 999;
+    if (capL > 999) capL = 999;
+    const int cap = static_cast<int>(capL);
+    const long exCount = static_cast<long>(g_myExCount);
+    const long long win = static_cast<long long>(g_myWindow);
+    const bool inWindow = (win <= 0) ||
+        (s_lastHitAt != 0 &&
+         static_cast<long long>(GetTickCount64() - s_lastHitAt) <= win);
+    int boosted = 0;
+
+    for (int i = 0; i < 30; ++i) {
+        if (!ids[i] || !items[i]) continue;
+        const bool sameStack = (s_ids[i] == ids[i]);
+        // 同堆：只取增量；新出现的槽：整堆都算本次掉落。
+        const int delta = sameStack ? (counts[i] - s_counts[i])
+                                    : counts[i];
+        if (delta <= 0) continue;
+
+        char name[64] = {};
+        PaMyNameUtf8(ids[i], name, sizeof(name));
+
+        // 两种模式：
+        //  ids= 非空 -> 精确模式，只放大白名单（可带 id@倍率）
+        //  ids= 为空 -> 宽模式，放大所有掉落，只跳过 exclude=
+        //              （自动覆盖任意层矿石 + 抽选池里的稀有煤矿）
+        long mul = 0;
+        const char* reason = nullptr;
+        if (!inWindow) {
+            reason = "outside hit window";
+        } else if (idCount > 0) {
+            for (long k = 0; k < idCount; ++k) {
+                if (g_myIds[k] == ids[i]) {
+                    mul = g_myIdMul[k] > 0 ? g_myIdMul[k] : globalMul;
+                    break;
+                }
+            }
+            if (mul <= 0) reason = "not in ids=";
+        } else {
+            bool excluded = false;
+            for (long k = 0; k < exCount; ++k) {
+                if (g_myExIds[k] == ids[i]) { excluded = true; break; }
+            }
+            if (excluded) reason = "in exclude=";
+            else mul = globalMul;
+        }
+        if (mul <= 0) {
+            Log("[PA] mine boost: PASS id=%llu name=%s +%d slot=%d "
+                "layer=%u rem=%u (%s)\n",
+                ids[i], name, delta, i, floor, rem,
+                reason ? reason : "unknown");
+            continue;
+        }
+        if (mul > 20) mul = 20;
+
+        if (!g_nearbyItemAdjust) {
+            Log("[PA] mine boost: item adjust NOT bound id=%llu\n", ids[i]);
+            continue;
+        }
+
+        NearbyItemInfo before = {};
+        if (!NearbyReadItem(items[i], &before) ||
+            before.itemId != ids[i]) {
+            continue;
+        }
+        int room = 999 - before.stackCount;
+        if (g_nearbyCommandCapacity) {
+            NearbyCommandItem d = {};
+            d.item = items[i];
+            int r = 0;
+            __try { r = g_nearbyCommandCapacity(&d); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
+            if (r > 0 && r < room) room = r;
+        }
+        int extra = delta * (static_cast<int>(mul) - 1);
+        if (extra > room) extra = room;
+        if (extra > cap) extra = cap;
+        if (extra <= 0) {
+            Log("[PA] mine boost: SKIP id=%llu room=%d delta=%d\n",
+                ids[i], room, delta);
+            continue;
+        }
+
+        PaSafeItemAdjust(g_nearbyItemAdjust, items[i], extra);
+        NearbyItemInfo after = {};
+        const bool ok = NearbyReadItem(items[i], &after) &&
+                        after.itemId == ids[i] &&
+                        after.stackCount == before.stackCount + extra;
+        if (ok) {
+            Log("[PA] mine boost: BOOST id=%llu name=%s %d->%d "
+                "(drop +%d x%ld) slot=%d layer=%u rem=%u\n",
+                ids[i], name, before.stackCount, after.stackCount,
+                delta, mul, i, floor, rem);
+        } else {
+            Log("[PA] mine boost: VERIFY FAILED id=%llu before=%d "
+                "after=%d want=%d\n",
+                ids[i], before.stackCount, after.stackCount, extra);
+        }
+        // 无论成功与否，快照都对齐到「实际值」，杜绝自激重复放大。
+        counts[i] = ok ? after.stackCount : before.stackCount;
+        if (ok) boosted += extra;
+    }
+
+    memcpy(s_ids, ids, sizeof(ids));
+    memcpy(s_counts, counts, sizeof(counts));
+    if (boosted > 0) PaMyRefresh();
+}
+
 static void PaMineYieldTick() {
     PaMineYieldPollConfig();
     const long mode = g_myMode;
     if (!mode) return;
     static unsigned long long s_last = 0;
     const unsigned long long now = GetTickCount64();
-    const unsigned long long interval = (mode == 3) ? 100ULL : 500ULL;
+    const unsigned long long interval =
+        (mode == 3 || mode == 6) ? 100ULL : 500ULL;
     if (now - s_last < interval) return;
     s_last = now;
 
@@ -5958,6 +6172,10 @@ static void PaMineYieldTick() {
     }
     if (mode == 5) {
         PaMyPtrProbe(save, floor, rem);
+        return;
+    }
+    if (mode == 6) {
+        PaMyBoostTick(save, floor, rem);
         return;
     }
     if (mode != 2) return;
