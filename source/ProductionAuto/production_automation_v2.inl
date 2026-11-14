@@ -4243,6 +4243,87 @@ static void PaMineTallyModule(const char* m) {
     }
 }
 
+// ============================================================
+// 2026-11-14【矿洞 level 探针·第二轮】只读 dump save+0x34E8
+// 目标：定位本层石头对象数组，为「整层清场」提供 landID 来源。
+// ============================================================
+static void PaMineLevelProbeTick(void* save) {
+    if (!g_paMineProbe) return;
+    static ULONGLONG s_lastDump = 0;
+    static unsigned char s_prev[0x400] = {};
+    static bool s_hasPrev = false;
+    static unsigned int s_prevRem = 0;
+    const ULONGLONG now = GetTickCount64();
+
+    void* lvl = nullptr;
+    if (!PaReadPtr(save, 0x34E8, &lvl) || !lvl) {
+        Log("[PA] mine level: UNAVAILABLE save=%p (not in mine?)\n", save);
+        return;
+    }
+
+    unsigned char buf[0x400] = {};
+    __try {
+        memcpy(buf, lvl, sizeof(buf));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[PA] mine level: SEH read fail lvl=%p\n", lvl);
+        return;
+    }
+
+    const unsigned int floor =
+        *reinterpret_cast<const unsigned int*>(buf + 0x34);
+    const unsigned char gate = buf[0x38];
+    const unsigned int rem =
+        *reinterpret_cast<const unsigned int*>(buf + 0x3C);
+    const bool valid = (rem > 0 && rem < 10000 && floor < 1000);
+    const bool remChanged = s_hasPrev && rem != s_prevRem;
+
+    // b 变化立即 dump；否则 15 秒一次。无效状态也 dump（便于诊断偏移漂移）。
+    if (!remChanged && s_lastDump != 0 && now - s_lastDump < 15000ULL) return;
+    s_lastDump = now;
+    s_prevRem = rem;
+
+    Log("[PA] mine level: lvl=%p floor=%u gate=%u rem=%u valid=%d changed=%d\n",
+        lvl, floor, static_cast<unsigned>(gate), rem,
+        valid ? 1 : 0, remChanged ? 1 : 0);
+
+    // 只打印与上次快照不同的 16B 行；无效时仅打前 0x80。
+    const size_t limit = valid ? sizeof(buf) : 0x80;
+    for (size_t off = 0; off < limit; off += 16) {
+        if (s_hasPrev && memcmp(buf + off, s_prev + off, 16) == 0) continue;
+        const unsigned long long a =
+            *reinterpret_cast<const unsigned long long*>(buf + off);
+        const unsigned long long b =
+            *reinterpret_cast<const unsigned long long*>(buf + off + 8);
+        Log("[PA] mine level:   +%03X: %016llX %016llX\n",
+            static_cast<unsigned>(off), a, b);
+    }
+    memcpy(s_prev, buf, sizeof(buf));
+    s_hasPrev = true;
+    if (!valid) return;
+
+    // 追踪像堆指针的字段：dump 其指向的前 0x40 字节（最多 10 个）。
+    // 本层石头数组 / 对象链表通常就挂在其中一个指针上。
+    int shown = 0;
+    for (size_t off = 0; off < sizeof(buf) && shown < 10; off += 8) {
+        const unsigned long long v =
+            *reinterpret_cast<const unsigned long long*>(buf + off);
+        if (v < 0x10000000000ULL || v > 0x7FFFFFFFFFFFULL) continue;
+        unsigned char sub[0x40] = {};
+        __try {
+            memcpy(sub, reinterpret_cast<const void*>(v), sizeof(sub));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+        Log("[PA] mine level: PTR +%03X -> %p : %016llX %016llX %016llX %016llX\n",
+            static_cast<unsigned>(off), reinterpret_cast<void*>(v),
+            *reinterpret_cast<const unsigned long long*>(sub),
+            *reinterpret_cast<const unsigned long long*>(sub + 8),
+            *reinterpret_cast<const unsigned long long*>(sub + 16),
+            *reinterpret_cast<const unsigned long long*>(sub + 24));
+        ++shown;
+    }
+}
+
 // 挂在 mod_tick：每 500ms 读一次背包，打印本轮新出现 / 数量增加的物品。
 // save+0x32c0 是玩家背包槽数组（与 ChestSort 同源），固定读 30 槽。
 static void PaMineProbeTick() {
@@ -4258,6 +4339,8 @@ static void PaMineProbeTick() {
     void* save = nullptr;
     if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
         !root || !PaReadPtr(root, PA_SAVE_OFFSET, &save) || !save) return;
+
+    PaMineLevelProbeTick(save);  // 矿洞 level 对象探针（只读）
 
     constexpr size_t kSlots = 30;
     void** slots = reinterpret_cast<void**>(
