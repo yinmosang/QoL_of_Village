@@ -4350,6 +4350,145 @@ static void PaInstallMineHook() {
 }
 
 // ============================================================
+// 2026-11-14【矿洞 hook 探针·第五轮】ShakeTreeSettle 汇合点
+// 第 4 轮证明矿洞绕过 HarvestSettle；改挂 0x1AAA40（挖矿判定 0x1ABDF0
+// 的唯一调用者，必被触发，且有 11 个调用者=全部工具结算汇合点）。
+// 序言前 15 字节恰为完整指令边界 -> 手写 FF25 + 15B trampoline。
+// 开关 qol_pa_mineshake.txt；删掉即完全不挂钩。纯记录+转发。
+// ============================================================
+using PaShakeSettleFn = void(__fastcall*)(void*, void*, unsigned long long,
+                                          void*, float, int, unsigned short);
+static PaShakeSettleFn g_mineShakeOrig = nullptr;
+static volatile int g_paMineShake = 0;
+static unsigned long long g_mineShakeLastA1 = 0;
+
+static bool PaWriteCodeBytes(void* dst, const void* src, size_t n) {
+    DWORD oldProt = 0;
+    if (!VirtualProtect(dst, n, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    memcpy(dst, src, n);
+    DWORD tmpProt = 0;
+    const bool restored = (VirtualProtect(dst, n, oldProt, &tmpProt) != 0);
+    FlushInstructionCache(GetCurrentProcess(), dst, n);
+    return restored;
+}
+
+static void PaDumpPtr(const char* tag, void* p) {
+    if (!p) return;
+    unsigned char b[0x20] = {};
+    int ok = 0;
+    __try {
+        memcpy(b, p, sizeof(b));
+        ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = 0;
+    }
+    if (!ok) return;
+    Log("[PA] mine shake:   %s=%p : %016llX %016llX %016llX %016llX\n",
+        tag, p,
+        *reinterpret_cast<const unsigned long long*>(b),
+        *reinterpret_cast<const unsigned long long*>(b + 8),
+        *reinterpret_cast<const unsigned long long*>(b + 16),
+        *reinterpret_cast<const unsigned long long*>(b + 24));
+}
+
+static void __fastcall PaMineShakeDetour(void* a1, void* a2,
+                                         unsigned long long a3, void* a4,
+                                         float a5, int a6, unsigned short a7) {
+    if (g_paMineShake) {
+        const unsigned long long key =
+            reinterpret_cast<unsigned long long>(a1);
+        if (key != g_mineShakeLastA1) {
+            g_mineShakeLastA1 = key;
+            Log("[PA] mine shake: a1=%p a2=%p a3=0x%llX a4=%p a5=%.2f "
+                "a6=%d a7=%u rem=%u\n",
+                a1, a2, a3, a4, static_cast<double>(a5), a6,
+                static_cast<unsigned>(a7), PaMineReadRem());
+            PaDumpPtr("a1", a1);
+            PaDumpPtr("a2", a2);
+            PaDumpPtr("a4", a4);
+            static int s_stackDumps = 0;
+            if (g_paCaptureStack && s_stackDumps < 8) {
+                ++s_stackDumps;
+                PVOID frames[10] = {};
+                ULONG hash = 0;
+                USHORT n = g_paCaptureStack(0, 10, frames, &hash);
+                const uintptr_t exe =
+                    reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                for (USHORT i = 0; i < n && i < 10; ++i) {
+                    const unsigned long long rva =
+                        static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(frames[i]) - exe);
+                    Log("[PA] mine shake:   frame[%u]=0x%llX\n",
+                        static_cast<unsigned>(i), rva);
+                }
+            }
+        }
+    }
+    if (g_mineShakeOrig)
+        g_mineShakeOrig(a1, a2, a3, a4, a5, a6, a7);
+}
+
+static void PaInstallMineShakeHook() {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    wcscat_s(path, MAX_PATH, L"qol_pa_mineshake.txt");
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
+
+    const uintptr_t base =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    unsigned char* target =
+        reinterpret_cast<unsigned char*>(base + 0x1AAA40);
+    // 15 字节 = 完整指令边界；不匹配就拒绝安装（项目有截断序言崩溃实证）。
+    static const unsigned char kPrologue[15] = {
+        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x50, 0x10,
+        0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
+    if (memcmp(target, kPrologue, sizeof(kPrologue)) != 0) {
+        Log("[PA] mine shake: prologue MISMATCH, NOT installed\n");
+        return;
+    }
+
+    unsigned char* tramp = static_cast<unsigned char*>(VirtualAlloc(
+        nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!tramp) return;
+    memcpy(tramp, target, 15);
+    unsigned char jumpBack[14] = {0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    *reinterpret_cast<unsigned long long*>(jumpBack + 6) =
+        reinterpret_cast<unsigned long long>(target + 15);
+    memcpy(tramp + 15, jumpBack, sizeof(jumpBack));
+    FlushInstructionCache(GetCurrentProcess(), tramp, 64);
+    DWORD tmpProt = 0;
+    VirtualProtect(tramp, 64, PAGE_EXECUTE_READ, &tmpProt);
+
+    unsigned char hook[15] = {
+        0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90};
+    *reinterpret_cast<unsigned long long*>(hook + 6) =
+        reinterpret_cast<unsigned long long>(&PaMineShakeDetour);
+    if (!PaWriteCodeBytes(target, hook, sizeof(hook))) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        Log("[PA] mine shake: write FAILED, NOT installed\n");
+        return;
+    }
+    g_mineShakeOrig = reinterpret_cast<PaShakeSettleFn>(tramp);
+    if (!g_paCaptureStack) {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll) {
+            g_paCaptureStack = reinterpret_cast<PaCaptureStackFn>(
+                GetProcAddress(ntdll, "RtlCaptureStackBackTrace"));
+        }
+    }
+    g_paMineShake = 1;
+    Log("[PA] mine shake: install=1 stack=%d\n",
+        g_paCaptureStack ? 1 : 0);
+}
+
+// ============================================================
 // 2026-11-14【矿洞 level 探针·第二轮】只读 dump save+0x34E8
 // 目标：定位本层石头对象数组，为「整层清场」提供 landID 来源。
 // ============================================================

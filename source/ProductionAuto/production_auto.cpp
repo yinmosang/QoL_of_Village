@@ -1119,7 +1119,7 @@ extern "C" __declspec(dllexport) void mod_init(void) {
     Log("[ProductionAuto] InstallProductionAutomation = %s\n",
         productionReady ? "OK" : "FAILED");
 
-    PaInstallMineHook();  // 2026-11-14 矿洞 hook 探针（开关文件控制，缺省不挂钩）
+    PaInstallMineShakeHook();  // 2026-11-14 矿洞 hook 探针·第五轮（开关控制）
 
     // ---- HotConfig: 注册所有 RVA 参数 ----
     HotConfig_Register("productionauto", (void*)&g_rva_game_root, "RVA_GAME_ROOT", HOT_RVA, 0x111CC90);
