@@ -5028,6 +5028,441 @@ static void PaMineProbeTick() {
     s_hasPrev = true;
 }
 
+// ============================================================
+// 2026-11-15【矿洞整层产出·第九轮】零 hook / 零重复结算 / 直接入包
+//
+// 第 8 轮证明「重复调 0x1B4F90」是死路：同一个 a1 不重新选石头，
+// 只 rem-1 + 重复同一份掉落 → 模型不消失、无矿石、掉落被清、rem 下溢。
+// 本块改为纯 mod_tick 轮询：检测挥镐 → 本层第一次挥镐时把整层产出
+// 按矿石 itemId 直接加到玩家背包 / 全场箱子的同类堆。
+// 完全不经过地上掉落（不会被清），不碰 rem、不碰动作状态机、不装 hook。
+// ============================================================
+static volatile long g_myEntryCount = 0;   // PaTick 每 5 秒刷新
+static volatile long g_myMode = 0;         // 0=off, 1=probe, 2=yield
+static volatile long g_myPer = 1;
+static volatile long g_myCap = 300;
+static unsigned long long g_myLo = 230000;
+static unsigned long long g_myHi = 250000;
+static unsigned long long g_myIds[16] = {};
+static volatile long g_myIdCount = 0;
+
+struct PaMyStack {
+    unsigned long long id;
+    void* item;
+    int rank;
+    int count;
+    int isBag;
+};
+static PaMyStack g_myStacks[256];
+
+static const char* PaMyFind(const char* s, const char* key) {
+    if (!s || !key) return nullptr;
+    for (const char* p = s; *p; ++p) {
+        const char* a = p;
+        const char* b = key;
+        while (*a && *b && *a == *b) { ++a; ++b; }
+        if (!*b) return p;
+    }
+    return nullptr;
+}
+
+static unsigned long long PaMyParseU64(const char* p) {
+    unsigned long long v = 0;
+    if (!p) return 0;
+    while (*p == ' ' || *p == '\t') ++p;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10ULL + static_cast<unsigned>(*p - '0');
+        ++p;
+    }
+    return v;
+}
+
+// 手写 u64 -> 十进制，避开 sprintf_s 模板/CRT 重载歧义与 SEH 限制。
+static size_t PaMyAppendU64(char* dst, size_t cap,
+                             unsigned long long v) {
+    char tmp[24] = {};
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v) {
+        tmp[n++] = static_cast<char>('0' + (v % 10ULL));
+        v /= 10ULL;
+    }
+    size_t w = 0;
+    while (n > 0 && w + 1 < cap) dst[w++] = tmp[--n];
+    if (cap > 0) dst[w] = 0;
+    return w;
+}
+
+static void PaMineYieldPollConfig() {
+    static unsigned long long s_last = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now - s_last < 500ULL) return;
+    s_last = now;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    wcscat_s(path, MAX_PATH, L"qol_pa_mineyield.txt");
+
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        InterlockedExchange(&g_myMode, 0);
+        return;
+    }
+    char buf[256] = {};
+    DWORD got = 0;
+    ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(h);
+    if (got >= sizeof(buf)) got = sizeof(buf) - 1;
+    buf[got] = 0;
+
+    long mode = 0;
+    const char* p = PaMyFind(buf, "mode=");
+    if (p) {
+        p += 5;
+        if (strncmp(p, "probe", 5) == 0) mode = 1;
+        else if (strncmp(p, "yield", 5) == 0) mode = 2;
+    }
+    InterlockedExchange(&g_myMode, mode);
+
+    p = PaMyFind(buf, "per=");
+    if (p) InterlockedExchange(&g_myPer, static_cast<long>(PaMyParseU64(p + 4)));
+    p = PaMyFind(buf, "cap=");
+    if (p) InterlockedExchange(&g_myCap, static_cast<long>(PaMyParseU64(p + 4)));
+    p = PaMyFind(buf, "lo=");
+    if (p) g_myLo = PaMyParseU64(p + 3);
+    p = PaMyFind(buf, "hi=");
+    if (p) g_myHi = PaMyParseU64(p + 3);
+
+    long n = 0;
+    p = PaMyFind(buf, "ids=");
+    if (p) {
+        p += 4;
+        while (*p && n < 16) {
+            while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+            if (*p < '0' || *p > '9') break;
+            unsigned long long v = 0;
+            while (*p >= '0' && *p <= '9') {
+                v = v * 10ULL + static_cast<unsigned>(*p - '0');
+                ++p;
+            }
+            g_myIds[n++] = v;
+        }
+    }
+    g_myIdCount = n;
+
+    static long s_lastMode = -1;
+    if (mode != s_lastMode) {
+        s_lastMode = mode;
+        Log("[PA] mine yield: config mode=%ld ids=%ld per=%ld cap=%ld "
+            "lo=%llu hi=%llu\n", mode, n, static_cast<long>(g_myPer),
+            static_cast<long>(g_myCap), g_myLo, g_myHi);
+    }
+}
+
+// level = [[[exe+RVA_GAME_ROOT]+PA_SAVE_OFFSET]+0x34E8]
+//   +0x34 = floor, +0x3C = rem（MineHelper 实证，1.30 一致）
+static bool PaMineReadLevel(unsigned int* floorOut, unsigned int* remOut) {
+    const uintptr_t exe =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* root = nullptr;
+    void* save = nullptr;
+    void* lvl = nullptr;
+    if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
+        !root || !PaReadPtr(root, PA_SAVE_OFFSET, &save) || !save ||
+        !PaReadPtr(save, 0x34E8, &lvl) || !lvl) return false;
+    unsigned int f = 0;
+    unsigned int r = 0;
+    __try {
+        f = *reinterpret_cast<const unsigned int*>(
+            reinterpret_cast<unsigned char*>(lvl) + 0x34);
+        r = *reinterpret_cast<const unsigned int*>(
+            reinterpret_cast<unsigned char*>(lvl) + 0x3C);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    *floorOut = f;
+    *remOut = r;
+    return true;
+}
+
+// 收集「已存在的同类堆」：玩家背包 30 槽 + 全场箱子（g_entries）。
+// 只操作已被引擎认可的 item 对象，绝不凭空构造物品。
+static size_t PaMyCollectStacks(void* save) {
+    size_t n = 0;
+    constexpr size_t kSlots = 30;
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) + 0x32c0);
+    if (NearbyIsReadable(slots, kSlots * sizeof(void*))) {
+        for (size_t i = 0; i < kSlots && n < 256; ++i) {
+            void* item = slots[i];
+            if (!item) continue;
+            NearbyItemInfo info = {};
+            if (!NearbyReadItem(item, &info)) continue;
+            g_myStacks[n].id = info.itemId;
+            g_myStacks[n].item = item;
+            g_myStacks[n].rank = info.rank;
+            g_myStacks[n].count = info.stackCount;
+            g_myStacks[n].isBag = 1;
+            ++n;
+        }
+    }
+    const long ec = g_myEntryCount;
+    for (long j = 0; j < ec && j < PA_MAX_ENTRIES && n < 256; ++j) {
+        if (!g_entries[j].isChest || !g_entries[j].status) continue;
+        NearbyRawPointerVector inv = {};
+        if (!NearbyReadRawInventoryRelaxed(g_entries[j].status, &inv)) continue;
+        const size_t cnt =
+            (reinterpret_cast<uintptr_t>(inv.end) -
+             reinterpret_cast<uintptr_t>(inv.begin)) / sizeof(void*);
+        if (cnt > 64) continue;
+        for (size_t s = 0; s < cnt && n < 256; ++s) {
+            void* item = inv.begin[s];
+            if (!item) continue;
+            NearbyItemInfo info = {};
+            if (!NearbyReadItem(item, &info)) continue;
+            g_myStacks[n].id = info.itemId;
+            g_myStacks[n].item = item;
+            g_myStacks[n].rank = info.rank;
+            g_myStacks[n].count = info.stackCount;
+            g_myStacks[n].isBag = 0;
+            ++n;
+        }
+    }
+    return n;
+}
+
+// probe 档：每 500ms 比较背包，打印「新出现 / 数量增加」的 itemId。
+// 用户正常敲几块不同石头（普通石 / 铜矿 / 铁矿 / 金矿），
+// 这里就会吐出各类矿石的真实 itemId，用于填 ids= 白名单。
+static void PaMyProbeGain(void* save) {
+    constexpr size_t kSlots = 30;
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) + 0x32c0);
+    if (!NearbyIsReadable(slots, kSlots * sizeof(void*))) return;
+    unsigned long long ids[kSlots] = {};
+    int counts[kSlots] = {};
+    for (size_t i = 0; i < kSlots; ++i) {
+        void* item = slots[i];
+        if (!item) continue;
+        NearbyItemInfo info = {};
+        if (!NearbyReadItem(item, &info)) continue;
+        ids[i] = info.itemId;
+        counts[i] = info.stackCount;
+    }
+    static unsigned long long s_prevIds[kSlots] = {};
+    static int s_prevCounts[kSlots] = {};
+    static int s_hasPrev = 0;
+    if (s_hasPrev) {
+        for (size_t i = 0; i < kSlots; ++i) {
+            if (!ids[i]) continue;
+            int prev = 0;
+            for (size_t j = 0; j < kSlots; ++j) {
+                if (s_prevIds[j] == ids[i]) {
+                    prev = s_prevCounts[j];
+                    break;
+                }
+            }
+            if (counts[i] > prev) {
+                Log("[PA] mine yield: GAIN item=%llu %d -> %d slot=%zu\n",
+                    ids[i], prev, counts[i], i);
+            }
+        }
+    }
+    memcpy(s_prevIds, ids, sizeof(ids));
+    memcpy(s_prevCounts, counts, sizeof(counts));
+    s_hasPrev = 1;
+}
+
+// probe 档：每 5 秒 dump 背包 + 全场箱子里的全部 itemId（去重）。
+static void PaMyProbeDump(void* save, unsigned int floor, unsigned int rem) {
+    static unsigned long long s_last = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now - s_last < 5000ULL) return;
+    s_last = now;
+    const size_t n = PaMyCollectStacks(save);
+    unsigned long long seen[256] = {};
+    int seenN = 0;
+    for (size_t i = 0; i < n && seenN < 256; ++i) {
+        const unsigned long long id = g_myStacks[i].id;
+        int dup = 0;
+        for (int k = 0; k < seenN; ++k) {
+            if (seen[k] == id) { dup = 1; break; }
+        }
+        if (!dup) seen[seenN++] = id;
+    }
+    char line[768] = {};
+    size_t used = 0;
+    for (int k = 0; k < seenN && used < 700; ++k) {
+        if (used && used + 1 < sizeof(line)) line[used++] = ',';
+        used += PaMyAppendU64(line + used, sizeof(line) - used, seen[k]);
+    }
+    Log("[PA] mine yield: probe layer=%u rem=%u stacks=%zu ids[%d]=%s\n",
+        floor, rem, n, seenN, line);
+}
+
+// 收尾三件套（AutoHarvest / 畜产品回收已验证）：让游戏感知背包/箱子变化。
+static void PaMyRefresh() {
+    const uintptr_t exe =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* root = nullptr;
+    void* player = nullptr;
+    if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
+        !root || !PaReadPtr(root, NEARBY_ROOT_PLAYER_OFFSET, &player) ||
+        !player) return;
+    if (g_nearbyBatchRecalculate) {
+        __try { g_nearbyBatchRecalculate(player, false); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (g_nearbyBatchUiRefresh) {
+        __try { g_nearbyBatchUiRefresh(player, true); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (g_nearbyBatchDirty) {
+        __try { g_nearbyBatchDirty(player, 0x2bc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
+// 本层第一次挥镐时调用：按矿石白名单把整层产出加到已有同类堆。
+static void PaMineYieldPayout(void* save, unsigned int layerRem,
+                              unsigned int floor) {
+    const size_t n = PaMyCollectStacks(save);
+    if (n == 0) {
+        Log("[PA] mine yield: no stacks at all, skip\n");
+        return;
+    }
+
+    unsigned long long ids[16] = {};
+    long idCount = g_myIdCount;
+    if (idCount > 0) {
+        for (long i = 0; i < idCount; ++i) ids[i] = g_myIds[i];
+    } else {
+        // 未给 ids=：从已有堆里按 [lo,hi) 自适应挑矿石（probe 可校准区间）
+        for (size_t i = 0; i < n && idCount < 16; ++i) {
+            const unsigned long long id = g_myStacks[i].id;
+            if (id < g_myLo || id >= g_myHi) continue;
+            int dup = 0;
+            for (long k = 0; k < idCount; ++k) {
+                if (ids[k] == id) { dup = 1; break; }
+            }
+            if (!dup) ids[idCount++] = id;
+        }
+    }
+    if (idCount <= 0) {
+        Log("[PA] mine yield: NO ore ids (set ids= in config), skip\n");
+        return;
+    }
+
+    long per = g_myPer;
+    if (per < 1) per = 1;
+    long cap = g_myCap;
+    if (cap < 1) cap = 300;
+    long long total = static_cast<long long>(layerRem) * per;
+    if (total > cap) total = cap;
+    long long each = total / idCount;
+    if (each < 1) each = 1;
+
+    int added = 0;
+    bool stop = false;
+    for (long k = 0; k < idCount && !stop; ++k) {
+        int want = static_cast<int>(each);
+        for (size_t i = 0; i < n && want > 0; ++i) {
+            if (g_myStacks[i].id != ids[k]) continue;
+            NearbyItemInfo before = {};
+            if (!NearbyReadItem(g_myStacks[i].item, &before)) continue;
+            int room = 999 - before.stackCount;
+            if (g_nearbyCommandCapacity) {
+                NearbyCommandItem d = {};
+                d.item = g_myStacks[i].item;
+                int r = 0;
+                __try { r = g_nearbyCommandCapacity(&d); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
+                if (r > 0 && r < room) room = r;
+            }
+            if (room <= 0) continue;
+            const int delta = (want < room) ? want : room;
+            PaSafeItemAdjust(g_nearbyItemAdjust, g_myStacks[i].item, delta);
+            NearbyItemInfo after = {};
+            if (!NearbyReadItem(g_myStacks[i].item, &after) ||
+                after.itemId != ids[k] ||
+                after.stackCount != before.stackCount + delta) {
+                // 读回不一致：立刻停止整轮，绝不对第二个堆再写（防复制）
+                Log("[PA] mine yield: VERIFY FAILED id=%llu before=%d "
+                    "after=%d want=%d -> STOP\n",
+                    ids[k], before.stackCount, after.stackCount, delta);
+                stop = true;
+                break;
+            }
+            Log("[PA] mine yield: add id=%llu x%d stack %d->%d %s\n",
+                ids[k], delta, before.stackCount, after.stackCount,
+                g_myStacks[i].isBag ? "(bag)" : "(chest)");
+            added += delta;
+            want -= delta;
+            g_myStacks[i].count = after.stackCount;
+        }
+        if (want > 0) {
+            Log("[PA] mine yield: no room for id=%llu short=%d\n",
+                ids[k], want);
+        }
+    }
+    if (added > 0) PaMyRefresh();
+    Log("[PA] mine yield: payout layer=%u rem=%u ids=%ld per=%ld added=%d%s\n",
+        floor, layerRem, idCount, per, added, stop ? " STOPPED" : "");
+}
+
+static void PaMineYieldTick() {
+    PaMineYieldPollConfig();
+    const long mode = g_myMode;
+    if (!mode) return;
+    static unsigned long long s_last = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now - s_last < 500ULL) return;
+    s_last = now;
+
+    const uintptr_t exe =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* root = nullptr;
+    void* save = nullptr;
+    if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
+        !root || !PaReadPtr(root, PA_SAVE_OFFSET, &save) || !save) return;
+
+    unsigned int floor = 0;
+    unsigned int rem = 0;
+    if (!PaMineReadLevel(&floor, &rem)) return;
+    // 不在矿洞 / rem 下溢（0xFFFFFFxx）时完全不动作。
+    // 注意：rem==0 必须放行 —— 那是「本层最后一块被敲掉」，仍需触发发放。
+    if (floor == 0 || floor > 200 || rem >= 0xFFFF0000u) return;
+
+    if (mode == 1) {
+        PaMyProbeGain(save);
+        PaMyProbeDump(save, floor, rem);
+        return;
+    }
+    if (mode != 2) return;
+
+    static unsigned int s_prevRem = 0;
+    static unsigned int s_prevFloor = 0;
+    static unsigned int s_paidFloor = 0xFFFFFFFFu;
+    // 换层 / rem 大幅回升 = 新一层，重置「已发放」标记
+    if (floor != s_prevFloor ||
+        (s_prevRem > 0 && rem > s_prevRem + 5)) {
+        s_paidFloor = 0xFFFFFFFFu;
+    }
+    const bool hit =
+        (s_prevRem > 0 && rem < s_prevRem && floor == s_prevFloor);
+    if (hit && s_paidFloor != floor) {
+        s_paidFloor = floor;
+        PaMineYieldPayout(save, s_prevRem, floor);
+    }
+    s_prevRem = rem;
+    s_prevFloor = floor;
+}
+
 static size_t PaEnumerateGimmicks(void* save) {
     if (!save) return 0;
     size_t count = 0;
@@ -6767,6 +7202,7 @@ static void PaTick(const PaWorldContext* ctx) {
 
     // 槽 1+2：枚举 + flood-fill 建组
     const size_t entryCount = PaEnumerateGimmicks(ctx->save);
+    g_myEntryCount = static_cast<long>(entryCount);  // 整层产出：箱子兜底用
     PaBuildGroups(entryCount);
     Log("[PA] scan: entries=%zu groups=%zu\n", entryCount, g_groupCount);
 

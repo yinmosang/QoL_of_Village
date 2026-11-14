@@ -1260,6 +1260,7 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
     PaCollectionProbeTick();  // 2026-11-14 收集册探针（只读，开关文件控制）
     PaMineProbeTick();        // 2026-11-14 矿洞探针（只读，开关文件控制）
     PaMineClearTick();        // 2026-11-14 矿洞整层清场（配置热生效，默认零写入）
+    PaMineYieldTick();        // 2026-11-15 矿洞整层产出（直接入包，零 hook）
 
     // v1.6.x: 观测层心跳（~10s 发布一次时钟源就绪态，供 AI 远程断言）
     static uint64_t s_obsHb = 0;
