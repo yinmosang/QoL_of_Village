@@ -862,18 +862,101 @@ static void ProcessRegistryChunk() {
 //   declared 数量；链表节点 +0=next / +8=prev / +0x10=status。
 //   ProductionAuto 用同一条链路实测一次枚举到 273 个 gimmick / 35 个箱子，
 //   覆盖跨房间跨地图，完全不依赖当前地图的 spatialIndex。
+// ============================================================
+// 2026-11-14【跨箱回收·性能修复】零 VirtualQuery 的全场扫描
+//   原实现遍历 2502 个 gimmick 节点时，每节点走 IsChestStatus 的
+//   4 次 IsReadable -> VirtualQuery；g_fastRegions 仅 16 槽且每次
+//   FastRegionReset 清空，缓存几乎必然未命中 => 上万次系统调用，
+//   实测按 F7 卡 3.4~3.8 秒（扫描 3.8s，后续转移仅 46ms）。
+//   现在整段链表遍历放进单个 SEH 帧：只做指针解引用 + POD 拷贝 +
+//   手写字符串比较（零 CRT 调用，避免 MSVC C2712），非法指针由
+//   __except 兜底。不动 IsReadable / FastRegionReset，原 spatialSearch
+//   路径的安全性完全保留。
+// ============================================================
+struct GlobalScanResult {
+    ChestEntry chests[MAX_REGISTRY];
+    size_t count;
+    size_t visited;
+};
+
+// 返回 false = 遍历途中触发访问违规，本轮结果作废（绝不崩游戏）
+static bool GlobalScanWalk(void* sentinel, unsigned long long declared,
+                           GlobalScanResult* out) {
+    out->count = 0;
+    out->visited = 0;
+    __try {
+        void* node = *reinterpret_cast<void**>(sentinel);
+        void* previous = sentinel;
+        for (unsigned long long i = 0;
+             i < declared && out->count < MAX_REGISTRY; ++i) {
+            if (!node || node == sentinel) break;
+            void** nd = reinterpret_cast<void**>(node);
+            if (nd[1] != previous) break;  // prev 链校验，防野指针跑飞
+            void* status = nd[2];         // node+0x10 = gimmick status
+            previous = node;
+            node = nd[0];                 // node+0 = next
+            ++out->visited;
+            if (!status) continue;
+
+            void* holder = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(status) +
+                GIMMICK_DATA_HOLDER_OFFSET);
+            if (!holder) continue;
+            void* data = *reinterpret_cast<void**>(holder);
+            if (!data) continue;
+            const char* name = *reinterpret_cast<const char* const*>(
+                reinterpret_cast<unsigned char*>(data) +
+                GIMMICK_MODULE_NAME_OFFSET);
+            if (!name) continue;
+
+            // 有界拷贝 + 手写比较（__try 内不调用任何 CRT，规避 C2712）
+            char buf[64];
+            size_t len = 0;
+            while (len + 1 < sizeof(buf) && name[len] != '\0') {
+                buf[len] = name[len];
+                ++len;
+            }
+            if (name[len] != '\0') continue;  // 64 字节内未终止，拒绝
+            buf[len] = '\0';
+            static const char kChest[] = "gimmick_chest";
+            bool match = (kChest[len] == '\0');
+            for (size_t k = 0; match && k < len; ++k) {
+                if (buf[k] != kChest[k]) match = false;
+            }
+            if (!match) continue;
+
+            const float* pos = reinterpret_cast<const float*>(
+                reinterpret_cast<unsigned char*>(status) +
+                GIMMICK_POSITION_OFFSET);
+            const float x = pos[0], y = pos[1];
+            if (!(x == x) || !(y == y)) continue;              // NaN
+            if (x < -1e9f || x > 1e9f || y < -1e9f || y > 1e9f) continue;
+
+            bool dup = false;
+            for (size_t j = 0; j < out->count; ++j) {
+                if (out->chests[j].status == status) { dup = true; break; }
+            }
+            if (dup) continue;
+            out->chests[out->count].status = status;
+            out->chests[out->count].posX = x;
+            out->chests[out->count].posY = y;
+            ++out->count;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
 static void StartGlobalRegistryScan(const WorldContext* ctx) {
     if (!ctx || !ctx->player) return;
-    FastRegionReset();
-    // 若启动预热的分片扫描还没跑完就按了 F7，先释放那份待处理向量，
-    // 避免它被静默丢弃（一次几十字节，但不留隐患）。
+    // 启动预热的分片扫描若还没跑完，先释放那份待处理向量，避免静默丢弃。
     if (G::scanPending) {
         ReleaseSearchVector(&G::pendingResults);
         G::scanPending = false;
     }
     G::registryCount = 0;
     G::registryValid = false;
-    G::scanPending = false;   // 不走 spatialSearch 分片路径
 
     constexpr uintptr_t kGimmickList = 0x3448;  // build 25640656
     void* sentinel = nullptr;
@@ -896,43 +979,20 @@ static void StartGlobalRegistryScan(const WorldContext* ctx) {
         return;
     }
 
-    void* node = *reinterpret_cast<void**>(sentinel);
-    void* previous = sentinel;
-    size_t visited = 0;
-    for (unsigned long long i = 0;
-         i < declared && G::registryCount < MAX_REGISTRY; ++i) {
-        if (!node || node == sentinel ||
-            !IsReadable(node, sizeof(void*) * 3)) break;
-        if (*reinterpret_cast<void**>(
-                reinterpret_cast<unsigned char*>(node) + sizeof(void*)) !=
-            previous) break;  // prev 链校验，防止野指针跑飞
-        void* status = *reinterpret_cast<void**>(
-            reinterpret_cast<unsigned char*>(node) + sizeof(void*) * 2);
-        previous = node;
-        node = *reinterpret_cast<void**>(node);
-        ++visited;
-
-        if (!status || !IsChestStatus(status)) continue;
-        const float* pos = reinterpret_cast<const float*>(
-            reinterpret_cast<unsigned char*>(status) +
-            GIMMICK_POSITION_OFFSET);
-        if (!IsReadable(pos, sizeof(float) * 4)) continue;
-        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1])) continue;
-
-        bool dup = false;
-        for (size_t j = 0; j < G::registryCount; ++j) {
-            if (G::registry[j].status == status) { dup = true; break; }
-        }
-        if (dup) continue;
-        G::registry[G::registryCount] = { status, pos[0], pos[1] };
-        ++G::registryCount;
+    static GlobalScanResult s_scan;  // 静态，避免 4KB 栈开销
+    const bool ok = GlobalScanWalk(sentinel, declared, &s_scan);
+    if (!ok) {
+        Log("[ChestSort] [global] 链表遍历被 SEH 拦截，本轮沿用已收集部分");
     }
-
+    for (size_t i = 0; i < s_scan.count; ++i) {
+        G::registry[i] = s_scan.chests[i];
+    }
+    G::registryCount = s_scan.count;
     G::registryValid = true;
     G::lastSearchX = ctx->position[0];
     G::lastSearchY = ctx->position[1];
     Log("[ChestSort] [global] 全场扫描: visited=%zu chests=%zu declared=%llu",
-        visited, G::registryCount, declared);
+        s_scan.visited, s_scan.count, declared);
 }
 
 // 从注册表中按坐标过滤附近的箱子，实时读取物品
