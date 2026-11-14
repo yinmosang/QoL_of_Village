@@ -5328,21 +5328,104 @@ static void PaMyRefresh() {
     }
 }
 
-// 本层第一次挥镐时调用：按矿石白名单把整层产出加到已有同类堆。
+// ============================================================
+// 2026-11-15【矿洞整层产出·第十轮】整层矿石「直接进背包」
+//
+// 第九轮只往「已有同类堆」加数量，背包没堆时全写进箱子 → 玩家看不见。
+// 本轮改用游戏原生的物品构造链（不是搬箱子里的 item 指针）：
+//   allocate(0x2C0) → memset → CItemStatus ctor(memory, save, itemId)
+//   → AddRef → setCount → rank → 读回验证 → CAS 写进背包空槽
+// 这套三件套是 ProductionAuto 自己 v1.5.6 起实机验证过的路径
+// （g_paItemAllocate / g_paItemCtor / g_paItemSetCount），
+// 与 AutoHarvest v1.9.6 的「物化+写空槽」完全同源。
+// 全程不生成地上掉落、不改 rem、不碰动作状态机、不装 hook。
+// ============================================================
+
+// 浮层提示单独 noinline：payout 内含 __try/__except，若把 obs.h 的 inline
+// obsPush/EventF 内联进来，MSVC 可能报 C2712（SEH 与对象展开冲突）。
+__declspec(noinline) static void PaMyToastPayout(int added, int created,
+                                                 int merged) {
+    qol::obs::EventF(1, qol::obs::OBS_TOAST_MS,
+        L"[矿洞] 整层产出 %d 件矿石已直接入包（新堆 %d / 叠加 %d）",
+        added, created, merged);
+}
+
+// 引擎侧物化三件套是否已由 InstallProductionAutomation() 绑定（无条件绑定）。
+// 不把 g_nearbyIntrusiveRelease 算进来：Nearby 侧有一长串 AOB 校验，任一失败
+// 就整段跳过初始化，但那个指针只用于失败回滚；缺失时
+// NearbyReleaseOwnedReference() 自带空指针保护会安全跳过，不影响主路径。
+static bool PaMyCanMaterialize() {
+    return g_paItemAllocate != nullptr && g_paItemCtor != nullptr &&
+           g_paItemSetCount != nullptr;
+}
+
+// 在玩家背包空槽里凭空物化一个新矿石堆。
+// save = *(root+0x208)，同时也是 CItemStatus 构造函数的第 2 参数。
+// 成功时物品留在槽里并持有 owned + slot 两份引用（与 AutoHarvest 成功路径
+// 一致，保证不会被游戏的回收/清理链销毁）；任何失败都释放自己加的引用。
+static bool PaMyCreateBagStack(void* save, unsigned long long itemId,
+                               int count, int rank, int* slotOut) {
+    if (!save || count < 1 || count > 999) return false;
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) +
+        NEARBY_PLAYER_ITEMS_OFFSET);
+    if (!NearbyIsReadable(slots, 30 * sizeof(void*))) return false;
+    int slot = -1;
+    for (int i = 0; i < 30; ++i) {
+        if (!slots[i]) { slot = i; break; }
+    }
+    if (slot < 0) return false;              // 背包 30 槽已满
+
+    void* memory = PaSafeItemAllocate(g_paItemAllocate, 0x2c0);
+    if (!memory || !NearbyIsReadable(memory, 0x2c0)) return false;
+    memset(memory, 0, 0x2c0);
+    void* item = PaSafeItemCtor(g_paItemCtor, memory, save,
+                                static_cast<u64>(itemId));
+    if (!item || item != memory) return false;
+    NearbyAddReference(item);                 // owned ref（事务持有）
+    *reinterpret_cast<int*>(
+        reinterpret_cast<unsigned char*>(item) +
+        NEARBY_ITEM_RANK_OFFSET) = rank;
+    PaSafeItemSetCount(g_paItemSetCount, item, count);
+    NearbyItemInfo verify = {};
+    if (!NearbyReadItem(item, &verify) ||
+        verify.itemId != itemId || verify.stackCount != count) {
+        NearbyReleaseOwnedReference(item);
+        return false;
+    }
+    NearbyAddReference(item);                 // slot ref
+    void* observed = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(&slots[slot]), item, nullptr);
+    if (observed != nullptr) {
+        NearbyReleaseOwnedReference(item);   // slot ref（未写入）
+        NearbyReleaseOwnedReference(item);   // owned ref
+        return false;
+    }
+    if (!NearbyIsReadable(&slots[slot], sizeof(void*)) ||
+        slots[slot] != item) {
+        InterlockedCompareExchangePointer(
+            reinterpret_cast<void* volatile*>(&slots[slot]), nullptr, item);
+        NearbyReleaseOwnedReference(item);
+        NearbyReleaseOwnedReference(item);
+        return false;
+    }
+    if (slotOut) *slotOut = slot;
+    return true;
+}
+
+// 本层第一次挥镐时调用：把整层矿石按白名单「直接发进玩家背包」。
+// 优先叠加到背包已有同类堆；背包没有同类堆时用原生构造在新空槽建堆。
+// 不再写任何箱子 —— 这是与第九轮的核心区别。
 static void PaMineYieldPayout(void* save, unsigned int layerRem,
                               unsigned int floor) {
     const size_t n = PaMyCollectStacks(save);
-    if (n == 0) {
-        Log("[PA] mine yield: no stacks at all, skip\n");
-        return;
-    }
-
+    // 白名单来源仍是运行时库存（背包 + 箱子）里的矿石 itemId 区间，
+    // 也可在 qol_pa_mineyield.txt 用 ids= 精确指定。
     unsigned long long ids[16] = {};
     long idCount = g_myIdCount;
     if (idCount > 0) {
         for (long i = 0; i < idCount; ++i) ids[i] = g_myIds[i];
     } else {
-        // 未给 ids=：从已有堆里按 [lo,hi) 自适应挑矿石（probe 可校准区间）
         for (size_t i = 0; i < n && idCount < 16; ++i) {
             const unsigned long long id = g_myStacks[i].id;
             if (id < g_myLo || id >= g_myHi) continue;
@@ -5364,15 +5447,38 @@ static void PaMineYieldPayout(void* save, unsigned int layerRem,
     if (cap < 1) cap = 300;
     long long total = static_cast<long long>(layerRem) * per;
     if (total > cap) total = cap;
-    long long each = total / idCount;
-    if (each < 1) each = 1;
+    long long eachLL = total / idCount;
+    if (eachLL < 1) eachLL = 1;
+    if (eachLL > 999) eachLL = 999;
+    const int each = static_cast<int>(eachLL);
+
+    const bool canCreate = PaMyCanMaterialize();
+    void** bagSlots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) +
+        NEARBY_PLAYER_ITEMS_OFFSET);
+    int freeSlots = 0;
+    if (NearbyIsReadable(bagSlots, 30 * sizeof(void*))) {
+        for (int i = 0; i < 30; ++i) if (!bagSlots[i]) ++freeSlots;
+    }
+    Log("[PA] mine yield: bag free=%d ids=%ld each=%d canCreate=%d\n",
+        freeSlots, idCount, each, canCreate ? 1 : 0);
+    if (!canCreate) {
+        Log("[PA] mine yield: materializer NOT bound, only merging into "
+            "existing bag stacks\n");
+    }
 
     int added = 0;
+    int merged = 0;
+    int created = 0;
+    int skipped = 0;
     bool stop = false;
     for (long k = 0; k < idCount && !stop; ++k) {
-        int want = static_cast<int>(each);
+        const unsigned long long id = ids[k];
+        int want = each;
+
+        // a) 先叠加到背包里已有的同类堆（不占新槽）
         for (size_t i = 0; i < n && want > 0; ++i) {
-            if (g_myStacks[i].id != ids[k]) continue;
+            if (!g_myStacks[i].isBag || g_myStacks[i].id != id) continue;
             NearbyItemInfo before = {};
             if (!NearbyReadItem(g_myStacks[i].item, &before)) continue;
             int room = 999 - before.stackCount;
@@ -5389,30 +5495,55 @@ static void PaMineYieldPayout(void* save, unsigned int layerRem,
             PaSafeItemAdjust(g_nearbyItemAdjust, g_myStacks[i].item, delta);
             NearbyItemInfo after = {};
             if (!NearbyReadItem(g_myStacks[i].item, &after) ||
-                after.itemId != ids[k] ||
+                after.itemId != id ||
                 after.stackCount != before.stackCount + delta) {
-                // 读回不一致：立刻停止整轮，绝不对第二个堆再写（防复制）
                 Log("[PA] mine yield: VERIFY FAILED id=%llu before=%d "
                     "after=%d want=%d -> STOP\n",
-                    ids[k], before.stackCount, after.stackCount, delta);
+                    id, before.stackCount, after.stackCount, delta);
                 stop = true;
                 break;
             }
-            Log("[PA] mine yield: add id=%llu x%d stack %d->%d %s\n",
-                ids[k], delta, before.stackCount, after.stackCount,
-                g_myStacks[i].isBag ? "(bag)" : "(chest)");
+            Log("[PA] mine yield: bag+ id=%llu x%d stack %d->%d\n",
+                id, delta, before.stackCount, after.stackCount);
             added += delta;
+            merged += delta;
             want -= delta;
             g_myStacks[i].count = after.stackCount;
         }
-        if (want > 0) {
-            Log("[PA] mine yield: no room for id=%llu short=%d\n",
-                ids[k], want);
+        if (stop) break;
+
+        // b) 背包里没有同类堆（或堆满）→ 用原生构造在空槽新建一堆
+        if (want > 0 && canCreate) {
+            int rank = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (g_myStacks[i].id == id) { rank = g_myStacks[i].rank; break; }
+            }
+            if (PaForcesRankZero(static_cast<u64>(id))) rank = 0;
+            int slot = -1;
+            if (PaMyCreateBagStack(save, id, want, rank, &slot)) {
+                Log("[PA] mine yield: bag NEW id=%llu x%d slot=%d rank=%d\n",
+                    id, want, slot, rank);
+                added += want;
+                created += want;
+                want = 0;
+            } else {
+                Log("[PA] mine yield: no free bag slot / materialize failed "
+                    "id=%llu short=%d\n", id, want);
+                skipped += want;
+            }
+        } else if (want > 0) {
+            skipped += want;
         }
     }
-    if (added > 0) PaMyRefresh();
-    Log("[PA] mine yield: payout layer=%u rem=%u ids=%ld per=%ld added=%d%s\n",
-        floor, layerRem, idCount, per, added, stop ? " STOPPED" : "");
+
+    if (added > 0) {
+        PaMyRefresh();
+        PaMyToastPayout(added, created, merged);
+    }
+    Log("[PA] mine yield: payout layer=%u rem=%u ids=%ld per=%ld "
+        "added=%d new=%d merge=%d skip=%d%s\n",
+        floor, layerRem, idCount, per, added, created, merged, skipped,
+        stop ? " STOPPED" : "");
 }
 
 static void PaMineYieldTick() {
