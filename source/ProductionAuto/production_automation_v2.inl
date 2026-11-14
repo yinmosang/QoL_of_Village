@@ -133,6 +133,11 @@ static volatile int g_paDumpKeys = 0;
 //   只读诊断：不写任何内存、不动任何物品。用于定位 gimmick_collection_machine
 //   的 status 结构与产出存放位置（它不在配方表也不是箱子，正常枚举会丢弃它）。
 static volatile int g_paRancherProbe = 0;
+// 2026-11-14【畜产品回收机自动回收】qol_pa_rancher_auto.txt 存在时开启。
+//   把每台 gimmick_collection_machine 的 items vector 产出原子转移到
+//   全场任意箱子的同类堆/空槽（跨房间、跨地图，整场一次枚举到齐）。
+//   默认关闭：不放该文件就不写任何物品，删文件即完全恢复，无需重编。
+static volatile int g_paRancherAuto = 0;
 // v1.5.53-diag：投料后触碰 UI 同步键（UIManpu+1），触发面板重绘。
 // v1.5.78 尝试：g_paTouchUi=1（作者原意"默认开"），但 2026-10-22 用户实测：
 //   手动投料能触发动画、PA 自动投料不能 → 该键仅触发面板重绘，动画/进度条由
@@ -4299,12 +4304,12 @@ static size_t PaEnumerateGimmicks(void* save) {
                 //   都读模块名（原本只对非机器读）——否则回收机两不沾
                 //   （非配方机器、非箱子）会被静默丢弃，日志连 orphan 都没有。
                 bool moduleRead = false;
-                if (!isMachine || g_paRancherProbe) {
+                if (!isMachine || g_paRancherProbe || g_paRancherAuto) {
                     moduleRead =
                         PaReadGimmickModule(status, module, sizeof(module));
                 }
                 if (moduleRead) isChest = PaIsChestModule(module);
-                if (g_paRancherProbe && moduleRead) {
+                if ((g_paRancherProbe || g_paRancherAuto) && moduleRead) {
                     if (strstr(module, "collection") &&
                         g_rancherCount <
                             sizeof(g_rancherEntries) /
@@ -4492,6 +4497,193 @@ static bool PaIsOrthoNeighbor(float x1, float y1, float x2, float y2) {
 //   · v1.5.17 那句「上下左右相邻」是**旧口径，已废弃**，勿再引用；
 //     v1.5.30 的正交实现 PaIsOrthoNeighbor 见上方，是零调用死代码。
 // ============================================================
+
+// ============================================================
+// 2026-11-14【畜产品回收机自动回收】
+//   探针实测（故障日志/qol_productionauto.log 11:58）：
+//     · gimmick_collection_machine 全场 11 台，status+0x2b8 是 12 槽
+//       items vector，与箱子同款 NearbyRawPointerVector；
+//     · entries=273 / chests=35 一次枚举到齐 —— 跨房间跨地图都在内存，
+//       因此「分散在别的地图/房间的箱子」同样可回收；
+//     · 产出 itemId 130000/130020/130040/130060（畜产品）。
+//   红线：写箱成功 + 清槽失败 = 复制。
+//     ⇒ 顺序固定「先 CAS 摘除 → 再写箱(读回验证) → 失败 CAS 回滚原槽」。
+//       摘除失败就整轮不动，绝不出现两处同时持有同一物品。
+//   开关：qol_pa_rancher_auto.txt 存在才运行；删文件即恢复。
+// ============================================================
+
+// 把已「摘除」的 item 放进全场任意箱子。
+//   返回 true  = 物品已被箱子持有（同类堆并入 或 空槽持有）；
+//   返回 false = 一处都没写进去，调用方必须回滚原槽。
+// 注意：item 此刻仍带着「回收机原槽」那一份引用，由调用方统一释放/回滚。
+static bool PaRancherDeposit(void* item, const NearbyItemInfo& info,
+                             void** chestStatuses, size_t chestCount) {
+    if (!item || info.itemId == 0 || info.stackCount <= 0 ||
+        !chestStatuses || chestCount == 0) return false;
+
+    // ① 优先并入全场任意箱子的同类堆（同 id + 同 rank，且能整堆吃下）
+    //    只接受「整堆并入」，不做拆分 —— 拆分要改源对象数量，风险高。
+    for (size_t c = 0; c < chestCount; ++c) {
+        NearbyRawPointerVector inv = {};
+        if (!NearbyReadRawInventoryRelaxed(chestStatuses[c], &inv)) continue;
+        const size_t cnt =
+            (reinterpret_cast<uintptr_t>(inv.end) -
+             reinterpret_cast<uintptr_t>(inv.begin)) / sizeof(void*);
+        for (size_t s = 0; s < cnt; ++s) {
+            void* t = inv.begin[s];
+            if (!t) continue;
+            NearbyItemInfo ti = {};
+            if (!NearbyReadItem(t, &ti) || ti.itemId != info.itemId ||
+                ti.rank != info.rank) continue;
+            int capLimit = 999;
+            if (g_nearbyCommandCapacity) {
+                NearbyCommandItem descriptor = {};
+                descriptor.item = t;
+                const int rem = g_nearbyCommandCapacity(&descriptor);
+                if (rem <= 0) continue;
+                capLimit = ti.stackCount + rem;
+            }
+            if (capLimit - ti.stackCount < info.stackCount) continue;
+            const int before = ti.stackCount;
+            PaSafeItemAdjust(g_nearbyItemAdjust, t, info.stackCount);
+            // 读回验证：PaSafeItemAdjust 会吞异常，必须确认真的写进去了
+            NearbyItemInfo after = {};
+            if (!NearbyReadItem(t, &after) ||
+                after.stackCount != before + info.stackCount) {
+                // 无法区分「完全没写」与「写了但读回异常」→ 保守起见立即
+                // 放弃本次入箱，让调用方回滚原槽，绝不在同一轮里对第二个堆
+                // 再写一次（否则理论上可能复制）。
+                Log("[PA] rancher auto: merge verify FAILED item=%llu "
+                    "before=%d after=%d expected=%d (abort deposit)\n",
+                    static_cast<unsigned long long>(info.itemId), before,
+                    after.stackCount, before + info.stackCount);
+                return false;
+            }
+            Log("[PA] rancher auto: merged item=%llu x%d into chest[%zu] "
+                "stack %d->%d\n",
+                static_cast<unsigned long long>(info.itemId),
+                info.stackCount, c, before, after.stackCount);
+            return true;
+        }
+    }
+
+    // ② 没有可并入的同类堆 → 放进全场第一个空槽
+    for (size_t c = 0; c < chestCount; ++c) {
+        NearbyRawPointerVector inv = {};
+        if (!NearbyReadRawInventoryRelaxed(chestStatuses[c], &inv)) continue;
+        const size_t cnt =
+            (reinterpret_cast<uintptr_t>(inv.end) -
+             reinterpret_cast<uintptr_t>(inv.begin)) / sizeof(void*);
+        for (size_t s = 0; s < cnt; ++s) {
+            if (inv.begin[s] != nullptr) continue;
+            NearbyAddReference(item);  // 箱子槽所有权 +1
+            void* observed = InterlockedCompareExchangePointer(
+                reinterpret_cast<void* volatile*>(&inv.begin[s]),
+                item, nullptr);
+            if (observed != nullptr) {
+                NearbyReleaseOwnedReference(item);  // 撤销刚才的 AddRef
+                continue;
+            }
+            Log("[PA] rancher auto: moved item=%llu x%d into chest[%zu] "
+                "slot=%zu\n",
+                static_cast<unsigned long long>(info.itemId),
+                info.stackCount, c, s);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void PaCollectRancherOutputs(size_t entryCount, ULONGLONG now) {
+    if (!g_paRancherAuto || g_rancherCount == 0) return;
+    static ULONGLONG s_lastCollect = 0;
+    if (now - s_lastCollect < 5000ULL) return;  // 跟随扫描节奏，5 秒一轮
+    s_lastCollect = now;
+
+    // 全场箱子（isChest 已在枚举时按模块名判定，跨地图全都在 g_entries 里）
+    void* chestStatuses[PA_MAX_ENTRIES] = {};
+    size_t chestCount = 0;
+    for (size_t j = 0; j < entryCount && chestCount < PA_MAX_ENTRIES; ++j) {
+        if (g_entries[j].isChest && g_entries[j].status)
+            chestStatuses[chestCount++] = g_entries[j].status;
+    }
+    if (chestCount == 0) {
+        Log("[PA] rancher auto: no visible chests, skip\n");
+        return;
+    }
+
+    size_t moved = 0, failed = 0;
+    constexpr size_t kMaxPerRound = 32;  // 限流：单轮最多 32 堆，防一次性大搬
+    for (size_t r = 0; r < g_rancherCount && moved < kMaxPerRound; ++r) {
+        const PaRancherEntry& re = g_rancherEntries[r];
+        if (!re.status) continue;
+        NearbyRawPointerVector inv = {};
+        if (!NearbyReadRawInventoryRelaxed(re.status, &inv)) continue;
+        const size_t slots =
+            (reinterpret_cast<uintptr_t>(inv.end) -
+             reinterpret_cast<uintptr_t>(inv.begin)) / sizeof(void*);
+        for (size_t s = 0; s < slots && moved < kMaxPerRound; ++s) {
+            void** slotPtr = &inv.begin[s];
+            void* item = *slotPtr;
+            if (!item) continue;
+            NearbyItemInfo info = {};
+            if (!NearbyReadItem(item, &info) || info.itemId == 0 ||
+                info.stackCount <= 0) continue;
+
+            // ① 先原子摘除：CAS 成功 = 本格已被我们独占，游戏侧此刻已看不到
+            if (InterlockedCompareExchangePointer(
+                    reinterpret_cast<void* volatile*>(slotPtr),
+                    nullptr, item) != item) continue;
+
+            // ② 写箱（内部读回验证）
+            if (PaRancherDeposit(item, info, chestStatuses, chestCount)) {
+                // 摘除时接管的那一份引用：merge 分支让对象销毁，
+                // 空槽分支与 AddRef 抵消，两种情况都正好 release 一次。
+                NearbyReleaseOwnedReference(item);
+                ++moved;
+            } else {
+                // ③ 失败回滚：把物品放回原槽，物品一件不少
+                void* obs = InterlockedCompareExchangePointer(
+                    reinterpret_cast<void* volatile*>(slotPtr),
+                    item, nullptr);
+                if (obs != nullptr) {
+                    Log("[PA] rancher auto: ROLLBACK FAILED gid=%llu "
+                        "slot=%zu obs=%p item=%p\n",
+                        static_cast<unsigned long long>(re.gid), s, obs, item);
+                }
+                ++failed;
+            }
+        }
+    }
+
+    if (moved) {
+        // 收尾三件套（AutoHarvest 已验证）：让游戏感知箱子变化，
+        // 否则箱子 UI/存档/逻辑都看不到新物品。
+        const uintptr_t exeBase =
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        void* root = nullptr;
+        void* player = nullptr;
+        if (PaReadPtr(reinterpret_cast<void*>(exeBase + RVA_GAME_ROOT), 0,
+                      &root) && root &&
+            PaReadPtr(root, NEARBY_ROOT_PLAYER_OFFSET, &player) && player) {
+            if (g_nearbyBatchRecalculate) {
+                __try { g_nearbyBatchRecalculate(player, false); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            if (g_nearbyBatchUiRefresh) {
+                __try { g_nearbyBatchUiRefresh(player, true); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            if (g_nearbyBatchDirty) {
+                __try { g_nearbyBatchDirty(player, 0x2bc); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+        }
+    }
+    Log("[PA] rancher auto: round collectors=%zu chests=%zu moved=%zu "
+        "failed=%zu\n", g_rancherCount, chestCount, moved, failed);
+}
+
 static void PaBuildGroups(size_t entryCount) {
     g_groupCount = 0;
     if (entryCount == 0) return;
@@ -5549,6 +5741,11 @@ static void PaTick(const PaWorldContext* ctx) {
                     wcscat_s(p5, MAX_PATH, L"qol_pa_rancher_probe.txt");
                     g_paRancherProbe =
                         (GetFileAttributesW(p5) != INVALID_FILE_ATTRIBUTES);
+                    wchar_t p7[MAX_PATH] = {};
+                    wcscpy_s(p7, MAX_PATH, dir);
+                    wcscat_s(p7, MAX_PATH, L"qol_pa_rancher_auto.txt");
+                    g_paRancherAuto =
+                        (GetFileAttributesW(p7) != INVALID_FILE_ATTRIBUTES);
                     wchar_t p4[MAX_PATH] = {};
                     wcscpy_s(p4, MAX_PATH, dir);
                     wcscat_s(p4, MAX_PATH, L"qol_pa_nativepush.txt");
@@ -5569,9 +5766,11 @@ static void PaTick(const PaWorldContext* ctx) {
                 }
             }
             Log("[PA] diag flags: pushprobe=%d fasttest=%d dumpkeys=%d "
-                "rancher=%d nativepush=%d pushfeed=%d%s touchui=%d\n",
+                "rancher=%d rancherAuto=%d nativepush=%d pushfeed=%d%s "
+                "touchui=%d\n",
                 g_paPushProbe, g_paFastTest, g_paDumpKeys,
-                g_paRancherProbe, g_paNativePushTest, g_paUsePushFeed,
+                g_paRancherProbe, g_paRancherAuto, g_paNativePushTest,
+                g_paUsePushFeed,
                 g_paUsePushFeed
                     ? " (feed chain ENABLED)"
                     : " (DISABLED by qol_pa_pushfeed_off.txt)",
@@ -5707,6 +5906,9 @@ static void PaTick(const PaWorldContext* ctx) {
             }
         }
     }
+
+    // 2026-11-14【畜产品回收机自动回收】探针确认结构后启用的实际功能
+    PaCollectRancherOutputs(entryCount, now);
 
     // v1.5.21：组构成 + 孤立机器，**按拓扑变化重打**（箱子/机器动了就重出）
     //   旧版一次性打印 → 玩家中途挪箱子看不到新结果，误以为"箱子在隔壁却没连"。
