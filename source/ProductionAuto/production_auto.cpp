@@ -1120,6 +1120,7 @@ extern "C" __declspec(dllexport) void mod_init(void) {
         productionReady ? "OK" : "FAILED");
 
     PaInstallMineShakeHook();  // 2026-11-14 矿洞 hook 探针·第五轮（开关控制）
+    PaInstallMineClearHook();  // 2026-11-14 矿洞整层清场·第六轮（开关控制）
 
     // ---- HotConfig: 注册所有 RVA 参数 ----
     HotConfig_Register("productionauto", (void*)&g_rva_game_root, "RVA_GAME_ROOT", HOT_RVA, 0x111CC90);
@@ -1258,6 +1259,7 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
     HotConfig_Poll();
     PaCollectionProbeTick();  // 2026-11-14 收集册探针（只读，开关文件控制）
     PaMineProbeTick();        // 2026-11-14 矿洞探针（只读，开关文件控制）
+    PaMineClearTick();        // 2026-11-14 矿洞整层清场（配置热生效，默认零写入）
 
     // v1.6.x: 观测层心跳（~10s 发布一次时钟源就绪态，供 AI 远程断言）
     static uint64_t s_obsHb = 0;

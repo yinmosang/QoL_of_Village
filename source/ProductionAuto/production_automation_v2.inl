@@ -4487,6 +4487,265 @@ static void PaInstallMineShakeHook() {
     Log("[PA] mine shake: install=1 stack=%d\n",
         g_paCaptureStack ? 1 : 0);
 }
+// ============================================================
+// 2026-11-14【矿洞整层清场·第六轮】hook 镐结算包装 0x1B4F90
+// 序言 48 89 5C 24 10 是完整 5 字节指令 -> 共享 qol::HookInstall 可安全安装。
+// 函数体只用 rcx/rdx；[body+0x26C] 为「本次动作已处理」幂等标志，
+// 处理完置 1，因此游戏自身已有防重复结算保护。
+// 开关 qol_pa_mineclear.txt 内容热生效（500ms 轮询，无需重编译）：
+//   probe      -> 纯记录 + 转发，零写入（默认）
+//   extra=N    -> 每次挥镐后额外最多 N 次结算（走 trampoline，不递归）
+//   extra=all  -> 额外直到 rem=0
+//   追加 force -> 额外调用前清 [body+0x26C]
+// 安全阀：rem 不下降立即永久停用；>=100ms 一次、上限 64、仅 rem>0 生效。
+// ============================================================
+using PaPickSettleFn = void(__fastcall*)(void*, void*,
+                                        unsigned long long,
+                                        unsigned long long);
+static PaPickSettleFn g_mcOrig = nullptr;
+static volatile long g_mcInstalled = 0;
+static volatile long g_mcExtraCfg = 0;   // 0=probe, >0=次数, -1=all
+static volatile long g_mcForceCfg = 0;
+static volatile long g_mcPending = 0;
+static volatile long g_mcAborted = 0;
+static volatile long g_mcBusy = 0;
+static volatile long g_mcHaveArgs = 0;
+static void* g_mcA1 = nullptr;
+static unsigned char g_mcA2[0x100] = {};
+static unsigned long long g_mcA3 = 0;
+static unsigned long long g_mcA4 = 0;
+static unsigned long long g_mcLastKey = 0;
+
+static void __fastcall PaMineClearDetour(void* a1, void* a2,
+                                         unsigned long long a3,
+                                         unsigned long long a4) {
+    const unsigned int remBefore = PaMineReadRem();
+    if (g_mcInstalled) {
+        const unsigned long long key =
+            reinterpret_cast<unsigned long long>(a1) ^
+            (static_cast<unsigned long long>(remBefore) << 32);
+        if (key != g_mcLastKey) {
+            g_mcLastKey = key;
+            unsigned char obj[0x20] = {};
+            void* body = nullptr;
+            int guardVal = -1;
+            __try {
+                body = *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(a1) + 8);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                body = nullptr;
+            }
+            if (body) {
+                __try {
+                    memcpy(obj,
+                           reinterpret_cast<unsigned char*>(body) + 0x260,
+                           sizeof(obj));
+                    guardVal = obj[0x0C];   // body + 0x26C
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    guardVal = -1;
+                }
+            }
+            Log("[PA] mine clear: call a1=%p a2=%p a3=0x%llX a4=0x%llX "
+                "body=%p guard(+0x26C)=%d remBefore=%u\n",
+                a1, a2, a3, a4, body, guardVal, remBefore);
+            Log("[PA] mine clear:   body+0x260 = %016llX %016llX %016llX %016llX\n",
+                *reinterpret_cast<const unsigned long long*>(obj),
+                *reinterpret_cast<const unsigned long long*>(obj + 8),
+                *reinterpret_cast<const unsigned long long*>(obj + 16),
+                *reinterpret_cast<const unsigned long long*>(obj + 24));
+        }
+        // a2 可能是调用者栈地址 -> 复制内容到静态缓冲，供异步额外调用使用
+        int copied = 0;
+        __try {
+            memcpy(g_mcA2, a2, sizeof(g_mcA2));
+            copied = 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            copied = 0;
+        }
+        if (copied && a1) {
+            g_mcA1 = a1;
+            g_mcA3 = a3;
+            g_mcA4 = a4;
+            InterlockedExchange(&g_mcHaveArgs, 1);
+        }
+    }
+    if (g_mcOrig) g_mcOrig(a1, a2, a3, a4);
+    const unsigned int remAfter = PaMineReadRem();
+    if (g_mcInstalled && remBefore != remAfter) {
+        Log("[PA] mine clear: swing rem %u -> %u\n", remBefore, remAfter);
+        const long cfg = g_mcExtraCfg;
+        if (cfg != 0 && !g_mcAborted && remAfter > 0) {
+            long n = (cfg < 0) ? static_cast<long>(remAfter) : cfg;
+            if (n > 64) n = 64;
+            InterlockedExchange(&g_mcPending, n);
+        }
+    }
+}
+
+static const char* PaMineFindText(const char* h, const char* n) {
+    if (!h || !n) return nullptr;
+    for (const char* p = h; *p; ++p) {
+        const char* a = p;
+        const char* b = n;
+        while (*a && *b && *a == *b) { ++a; ++b; }
+        if (!*b) return p;
+    }
+    return nullptr;
+}
+
+static int PaMineParseUInt(const char* s) {
+    int v = 0, any = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        ++s;
+        ++any;
+        if (v > 9999) return 9999;
+    }
+    return any ? v : -1;
+}
+
+static void PaMineClearPollConfig() {
+    static unsigned long long s_last = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now - s_last < 500) return;
+    s_last = now;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    wcscat_s(path, MAX_PATH, L"qol_pa_mineclear.txt");
+
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        InterlockedExchange(&g_mcExtraCfg, 0);
+        InterlockedExchange(&g_mcForceCfg, 0);
+        InterlockedExchange(&g_mcPending, 0);
+        return;
+    }
+    char buf[64] = {};
+    DWORD got = 0;
+    ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(h);
+    if (got >= sizeof(buf)) got = sizeof(buf) - 1;
+    buf[got] = 0;
+
+    long cfg = 0;
+    const char* p = PaMineFindText(buf, "extra=");
+    if (p) {
+        const char* v = p + 6;
+        if (PaMineFindText(v, "all") == v) {
+            cfg = -1;
+        } else {
+            const int n = PaMineParseUInt(v);
+            if (n > 0) cfg = n;
+            if (cfg > 64) cfg = 64;
+        }
+    }
+    InterlockedExchange(&g_mcExtraCfg, cfg);
+    InterlockedExchange(&g_mcForceCfg,
+                        PaMineFindText(buf, "force") ? 1 : 0);
+    static long s_prevCfg = -9999;
+    if (cfg != s_prevCfg) {
+        s_prevCfg = cfg;
+        Log("[PA] mine clear: config extra=%ld force=%ld\n",
+            static_cast<long>(cfg), static_cast<long>(g_mcForceCfg));
+    }
+}
+
+// 清「本次动作已处理」标志，让同一动作上下文能被再次结算。
+static void PaMineClearGuard(void* a1) {
+    void* body = nullptr;
+    __try {
+        body = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(a1) + 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    if (!body) return;
+    __try {
+        *reinterpret_cast<volatile unsigned char*>(
+            reinterpret_cast<unsigned char*>(body) + 0x26C) = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static void PaMineClearTick() {
+    if (!g_mcInstalled) return;
+    PaMineClearPollConfig();
+    const long pending = g_mcPending;
+    if (pending <= 0 || g_mcAborted || !g_mcHaveArgs || !g_mcOrig) return;
+    static unsigned long long s_lastCall = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now - s_lastCall < 100) return;
+    const unsigned int remBefore = PaMineReadRem();
+    if (remBefore == 0) {
+        InterlockedExchange(&g_mcPending, 0);
+        return;
+    }
+    s_lastCall = now;
+    if (InterlockedCompareExchange(&g_mcBusy, 1, 0) != 0) return;
+    if (g_mcForceCfg) PaMineClearGuard(g_mcA1);
+
+    int seh = 0;
+    __try {
+        g_mcOrig(g_mcA1, reinterpret_cast<void*>(&g_mcA2[0]), g_mcA3, g_mcA4);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        seh = 1;
+    }
+    InterlockedExchange(&g_mcBusy, 0);
+    if (seh) {
+        InterlockedExchange(&g_mcPending, 0);
+        InterlockedExchange(&g_mcAborted, 1);
+        Log("[PA] mine clear: SEH in extra call -> DISABLED\n");
+        return;
+    }
+    const unsigned int remAfter = PaMineReadRem();
+    Log("[PA] mine clear: extra rem %u -> %u pending=%ld force=%ld\n",
+        remBefore, remAfter, pending - 1, static_cast<long>(g_mcForceCfg));
+    if (remAfter >= remBefore) {
+        InterlockedExchange(&g_mcPending, 0);
+        InterlockedExchange(&g_mcAborted, 1);
+        Log("[PA] mine clear: rem did NOT drop -> ABORT, feature disabled\n");
+    } else {
+        InterlockedExchange(&g_mcPending, pending - 1);
+    }
+}
+
+static void PaInstallMineClearHook() {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    wcscat_s(path, MAX_PATH, L"qol_pa_mineclear.txt");
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
+
+    const uintptr_t base =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    unsigned char* target =
+        reinterpret_cast<unsigned char*>(base + 0x1B4F90);
+    static const unsigned char kPrologue[5] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10};
+    if (memcmp(target, kPrologue, sizeof(kPrologue)) != 0) {
+        Log("[PA] mine clear: prologue MISMATCH, NOT installed\n");
+        return;
+    }
+    const bool ok = qol::HookInstall(
+        reinterpret_cast<uintptr_t>(target),
+        reinterpret_cast<uintptr_t>(&PaMineClearDetour),
+        reinterpret_cast<uintptr_t*>(&g_mcOrig));
+    g_mcInstalled = ok ? 1 : 0;
+    Log("[PA] mine clear: install=%d target=0x1B4F90\n", ok ? 1 : 0);
+}
+
 
 // ============================================================
 // 2026-11-14【矿洞 level 探针·第二轮】只读 dump save+0x34E8
