@@ -5128,6 +5128,7 @@ static void PaMineYieldPollConfig() {
         else if (strncmp(p, "yield", 5) == 0) mode = 2;
         else if (strncmp(p, "scan", 4) == 0) mode = 3;
         else if (strncmp(p, "vec", 3) == 0) mode = 4;
+        else if (strncmp(p, "ptr", 3) == 0) mode = 5;
     }
     InterlockedExchange(&g_myMode, mode);
 
@@ -5817,6 +5818,106 @@ static void PaMyVecDump(void* save, unsigned int floor, unsigned int rem) {
     }
 }
 
+// ============================================================
+// 2026-11-15【矿洞第十三轮·布局表解码只读探针】
+// +0x58 是本层布局表，但元素是 32 位唯一句柄。本轮判定它们能否拼回
+// 堆指针、解引用出类型字段；零写入、零 hook、不改 rem、不发放物品。
+// ============================================================
+static void PaMyPtrProbe(void* save, unsigned int floor, unsigned int rem) {
+    static unsigned int s_floor = 0xFFFFFFFFu;
+    static unsigned int s_rem = 0xFFFFFFFFu;
+    const bool enter = (floor != s_floor);
+    const bool hit = (!enter && s_rem != 0xFFFFFFFFu && rem < s_rem);
+    s_floor = floor;
+    s_rem = rem;
+    if (!enter && !hit) return;
+
+    void* lvl = PaMyReadLevelObj(save);
+    if (!lvl) return;
+    unsigned char* b = reinterpret_cast<unsigned char*>(lvl);
+    if (!NearbyIsReadable(b, 0xA0)) return;
+    unsigned char snap[0xA0] = {};
+    int snapOk = 0;
+    __try { memcpy(snap, b, 0xA0); snapOk = 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { snapOk = 0; }
+    if (!snapOk) return;
+
+    void** begin = *reinterpret_cast<void***>(snap + 0x58);
+    void** end = *reinterpret_cast<void***>(snap + 0x60);
+    size_t cnt = (end > begin) ? static_cast<size_t>(end - begin) : 0;
+    if (cnt > 160) cnt = 160;
+    if (!cnt || !NearbyIsReadable(begin, cnt * sizeof(void*))) return;
+
+    const uintptr_t highLvl = reinterpret_cast<uintptr_t>(lvl) &
+                              0xFFFFFFFF00000000ULL;
+    const uintptr_t highVec = reinterpret_cast<uintptr_t>(begin) &
+                              0xFFFFFFFF00000000ULL;
+    const uintptr_t highs[4] = {
+        highLvl, highVec,
+        highLvl - 0x100000000ULL, highLvl + 0x100000000ULL
+    };
+    size_t resolved[4] = {};
+    unsigned int hi8[256] = {};
+    unsigned long long typeVals[64] = {};
+    int typeCounts[64] = {};
+    int typeN = 0;
+    int dumped = 0;
+
+    for (size_t i = 0; i < cnt; ++i) {
+        const unsigned long long u = static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(begin[i]));
+        const unsigned int v32 = static_cast<unsigned int>(u & 0xFFFFFFFFULL);
+        ++hi8[v32 >> 24];
+        for (int h = 0; h < 4; ++h) {
+            void* cand = reinterpret_cast<void*>(
+                highs[h] | static_cast<uintptr_t>(v32));
+            if (!NearbyIsReadable(cand, 0x40)) continue;
+            ++resolved[h];
+            if (h != 0) continue;   // 只用主拼法做类型统计，避免重复计数
+            unsigned long long v[8] = {};
+            int vok = 0;
+            __try { memcpy(v, cand, 0x40); vok = 1; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { vok = 0; }
+            if (!vok) continue;
+            if (dumped < 6) {
+                Log("[PA] mine ptr: OBJ[%zu] cand=%p | %016llX %016llX "
+                    "%016llX %016llX | %016llX %016llX %016llX %016llX\n",
+                    i, cand, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+                ++dumped;
+            }
+            const unsigned long long t = v[4];   // +0x20 疑似类型枚举
+            if (t == 0 || t > 0x10000ULL) continue;
+            int found = 0;
+            for (int q = 0; q < typeN; ++q) {
+                if (typeVals[q] == t) { ++typeCounts[q]; found = 1; break; }
+            }
+            if (!found && typeN < 64) {
+                typeVals[typeN] = t; typeCounts[typeN] = 1; ++typeN;
+            }
+        }
+    }
+
+    Log("[PA] mine ptr: VERDICT layer=%u rem=%u vals=%zu "
+        "resLvl=%zu resVec=%zu resLow=%zu resHigh=%zu uniqType=%d\n",
+        floor, rem, cnt, resolved[0], resolved[1], resolved[2],
+        resolved[3], typeN);
+    for (int q = 0; q < typeN; ++q) {
+        Log("[PA] mine ptr:   OTYPE %016llX x%d\n",
+            typeVals[q], typeCounts[q]);
+    }
+    for (int k = 0; k < 256; ++k) {
+        if (hi8[k]) Log("[PA] mine ptr:   HI8 %02X x%u\n", k, hi8[k]);
+    }
+    for (size_t i = 0; i < cnt && i < 8; ++i) {
+        const unsigned long long u = static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(begin[i]));
+        const unsigned int v32 = static_cast<unsigned int>(u & 0xFFFFFFFFULL);
+        Log("[PA] mine ptr:   VAL[%02zu] %08X bytes=%02X %02X %02X %02X\n",
+            i, v32, (v32 >> 24) & 0xFF, (v32 >> 16) & 0xFF,
+            (v32 >> 8) & 0xFF, v32 & 0xFF);
+    }
+}
+
 static void PaMineYieldTick() {
     PaMineYieldPollConfig();
     const long mode = g_myMode;
@@ -5853,6 +5954,10 @@ static void PaMineYieldTick() {
     }
     if (mode == 4) {
         PaMyVecDump(save, floor, rem);
+        return;
+    }
+    if (mode == 5) {
+        PaMyPtrProbe(save, floor, rem);
         return;
     }
     if (mode != 2) return;
