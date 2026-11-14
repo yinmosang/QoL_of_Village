@@ -1254,6 +1254,7 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
     }
     const uint64_t budgetT0 = qol::budget::NowUs();
     HotConfig_Poll();
+    PaCollectionProbeTick();  // 2026-11-14 收集册探针（只读，开关文件控制）
 
     // v1.6.x: 观测层心跳（~10s 发布一次时钟源就绪态，供 AI 远程断言）
     static uint64_t s_obsHb = 0;

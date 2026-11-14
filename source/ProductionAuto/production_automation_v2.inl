@@ -138,6 +138,10 @@ static volatile int g_paRancherProbe = 0;
 //   全场任意箱子的同类堆/空槽（跨房间、跨地图，整场一次枚举到齐）。
 //   默认关闭：不放该文件就不写任何物品，删文件即完全恢复，无需重编。
 static volatile int g_paRancherAuto = 0;
+// 2026-11-14【收集册探针】qol_pa_collection_probe.txt 存在时开启。
+//   只读追踪 save 前 0x4000 字节的变化，用于定位「图鉴登记位」；
+//   不写游戏内存、不装 hook。删文件即完全关闭。
+static volatile int g_paCollectionProbe = 0;
 // v1.5.53-diag：投料后触碰 UI 同步键（UIManpu+1），触发面板重绘。
 // v1.5.78 尝试：g_paTouchUi=1（作者原意"默认开"），但 2026-10-22 用户实测：
 //   手动投料能触发动画、PA 自动投料不能 → 该键仅触发面板重绘，动画/进度条由
@@ -4684,6 +4688,96 @@ static void PaCollectRancherOutputs(size_t entryCount, ULONGLONG now) {
         "failed=%zu\n", g_rancherCount, chestCount, moved, failed);
 }
 
+// ============================================================
+// 2026-11-14【收集册探针】只读差异追踪
+//   save = [[exe + RVA_GAME_ROOT] + 0x208]（与 MonsterMark / ChestSort 同源）
+//   MonsterMark 实测：收集状态位图在 save+0x90 起，qword[flagIdx>>6]
+//   的 bit(flagIdx&63) 表示该 flag 已置位。
+//   本探针不假设图鉴具体布局：直接快照 save 前 0x4000 字节，
+//   每 500ms 打印所有变化 qword，并标注 0->1 的 SET。
+// ============================================================
+static int PaPopCount64(unsigned long long v) {
+    int n = 0;
+    while (v) { n += static_cast<int>(v & 1ULL); v >>= 1; }
+    return n;
+}
+
+static void PaCollectionProbeTick() {
+    if (!g_paCollectionProbe) return;
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_last < 500ULL) return;
+    s_last = now;
+
+    const uintptr_t exe =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* root = nullptr;
+    void* save = nullptr;
+    if (!PaReadPtr(reinterpret_cast<void*>(exe + RVA_GAME_ROOT), 0, &root) ||
+        !root || !PaReadPtr(root, PA_SAVE_OFFSET, &save) || !save) {
+        Log("[PA] collection probe: root/save unavailable\n");
+        return;
+    }
+    constexpr size_t kSpan = 0x4000;
+    const unsigned char* base =
+        reinterpret_cast<const unsigned char*>(save);
+    if (!NearbyIsReadable(base, kSpan)) {
+        Log("[PA] collection probe: save span unreadable save=%p\n", save);
+        return;
+    }
+
+    static unsigned char s_prev[kSpan] = {};
+    static bool s_hasPrev = false;
+
+    // 位图区摘要（0x90..0x490 = 前 128 个 qword = 8192 个 flag）
+    int bits = 0;
+    for (size_t off = 0x90; off < 0x490; off += 8) {
+        bits += PaPopCount64(
+            *reinterpret_cast<const unsigned long long*>(base + off));
+    }
+
+    if (!s_hasPrev) {
+        Log("[PA] collection probe: BASELINE save=%p bits(0x90..0x490)=%d\n",
+            save, bits);
+        for (size_t i = 0; i < 32; ++i) {
+            Log("[PA] collection probe: bitmap[%02zu]=%016llX\n", i,
+                static_cast<unsigned long long>(
+                    *reinterpret_cast<const unsigned long long*>(
+                        base + 0x90 + i * 8)));
+        }
+    } else {
+        size_t changed = 0, pureSets = 0;
+        static ULONGLONG s_lastSetLog = 0;
+        const bool mayLog = (now - s_lastSetLog >= 1000ULL);
+        for (size_t off = 0; off < kSpan; off += 8) {
+            const unsigned long long a =
+                *reinterpret_cast<const unsigned long long*>(s_prev + off);
+            const unsigned long long b =
+                *reinterpret_cast<const unsigned long long*>(base + off);
+            if (a == b) continue;
+            ++changed;
+            // 图鉴登记是「单向置位」；游戏时钟/坐标等噪声是任意值变化。
+            // 只保留纯 0->1（旧值的位全被新值包含）可极大降噪。
+            const bool pureSet = ((b & ~a) != 0) && ((a & ~b) == 0);
+            if (pureSet) {
+                ++pureSets;
+                if (pureSets <= 40 && mayLog) {
+                    Log("[PA] collection probe: SET +0x%04X "
+                        "%016llX -> %016llX\n",
+                        static_cast<unsigned>(off), a, b);
+                }
+            }
+        }
+        if (pureSets && mayLog) {
+            s_lastSetLog = now;
+            Log("[PA] collection probe: round changed=%zu sets=%zu bits=%d\n",
+                changed, pureSets, bits);
+        }
+    }
+    memcpy(s_prev, base, kSpan);
+    s_hasPrev = true;
+}
+
 static void PaBuildGroups(size_t entryCount) {
     g_groupCount = 0;
     if (entryCount == 0) return;
@@ -5746,6 +5840,11 @@ static void PaTick(const PaWorldContext* ctx) {
                     wcscat_s(p7, MAX_PATH, L"qol_pa_rancher_auto.txt");
                     g_paRancherAuto =
                         (GetFileAttributesW(p7) != INVALID_FILE_ATTRIBUTES);
+                    wchar_t p8[MAX_PATH] = {};
+                    wcscpy_s(p8, MAX_PATH, dir);
+                    wcscat_s(p8, MAX_PATH, L"qol_pa_collection_probe.txt");
+                    g_paCollectionProbe =
+                        (GetFileAttributesW(p8) != INVALID_FILE_ATTRIBUTES);
                     wchar_t p4[MAX_PATH] = {};
                     wcscpy_s(p4, MAX_PATH, dir);
                     wcscat_s(p4, MAX_PATH, L"qol_pa_nativepush.txt");
@@ -5766,10 +5865,11 @@ static void PaTick(const PaWorldContext* ctx) {
                 }
             }
             Log("[PA] diag flags: pushprobe=%d fasttest=%d dumpkeys=%d "
-                "rancher=%d rancherAuto=%d nativepush=%d pushfeed=%d%s "
+                "rancher=%d rancherAuto=%d collection=%d nativepush=%d pushfeed=%d%s "
                 "touchui=%d\n",
                 g_paPushProbe, g_paFastTest, g_paDumpKeys,
-                g_paRancherProbe, g_paRancherAuto, g_paNativePushTest,
+                g_paRancherProbe, g_paRancherAuto, g_paCollectionProbe,
+                g_paNativePushTest,
                 g_paUsePushFeed,
                 g_paUsePushFeed
                     ? " (feed chain ENABLED)"
