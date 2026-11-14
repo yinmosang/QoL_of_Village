@@ -5729,8 +5729,78 @@ static void PaMyVecDump(void* save, unsigned int floor, unsigned int rem) {
                 i, v[0], v[1], v[2], v[3]);
         }
 
+        // 元素形态统计：本层矿点表可能是「类型 ID/枚举数组」，也可能是
+        // 「对象指针数组」。两种情况各给一份直方图，一次测完就能判定。
+        //   TYPE  = 元素本身是小整数时的去重分布
+        //   OTYPE = 元素是指针时，其 +0x20 字段的去重分布
+        //          （历史 24 个静态对象的类型枚举就在 +0x20，值域 5..10）
+        size_t nPtr = 0, nSmall = 0, nZero = 0, nOther = 0;
+        unsigned long long smallVals[64] = {};
+        int smallCounts[64] = {};
+        int smallN = 0;
+        unsigned long long typeVals[64] = {};
+        int typeCounts[64] = {};
+        int typeN = 0;
+        for (size_t i = 0; i < show; ++i) {
+            void* e = begin[i];
+            const unsigned long long u = static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(e));
+            if (u == 0) { ++nZero; continue; }
+            if (u > 0x10000 && NearbyIsReadable(e, 0x28)) {
+                ++nPtr;
+                unsigned long long tv = 0;
+                int tok = 0;
+                __try {
+                    tv = *reinterpret_cast<const unsigned long long*>(
+                        reinterpret_cast<unsigned char*>(e) + 0x20);
+                    tok = 1;
+                } __except (EXCEPTION_EXECUTE_HANDLER) { tok = 0; }
+                if (tok && tv <= 0x10000ULL && tv != 0) {
+                    int found = 0;
+                    for (int q = 0; q < typeN; ++q) {
+                        if (typeVals[q] == tv) {
+                            ++typeCounts[q]; found = 1; break;
+                        }
+                    }
+                    if (!found && typeN < 64) {
+                        typeVals[typeN] = tv;
+                        typeCounts[typeN] = 1;
+                        ++typeN;
+                    }
+                }
+                continue;
+            }
+            if (u < 0x100000ULL) {
+                ++nSmall;
+                int found = 0;
+                for (int q = 0; q < smallN; ++q) {
+                    if (smallVals[q] == u) {
+                        ++smallCounts[q]; found = 1; break;
+                    }
+                }
+                if (!found && smallN < 64) {
+                    smallVals[smallN] = u;
+                    smallCounts[smallN] = 1;
+                    ++smallN;
+                }
+                continue;
+            }
+            ++nOther;
+        }
+        Log("[PA] mine vec: SHAPE +%03X ptr=%zu small=%zu zero=%zu "
+            "other=%zu uniqType=%d uniqSmall=%d\n",
+            offs[vi], nPtr, nSmall, nZero, nOther, typeN, smallN);
+        for (int q = 0; q < typeN; ++q) {
+            Log("[PA] mine vec:   OTYPE %016llX x%d\n",
+                typeVals[q], typeCounts[q]);
+        }
+        for (int q = 0; q < smallN; ++q) {
+            Log("[PA] mine vec:   TYPE  %016llX x%d\n",
+                smallVals[q], smallCounts[q]);
+        }
+
         int dumped = 0;
-        for (size_t i = 0; i < show && dumped < 3; ++i) {
+        for (size_t i = 0; i < show && dumped < 8; ++i) {
             void* e = begin[i];
             if (!e || reinterpret_cast<uintptr_t>(e) < 0x10000) continue;
             if (!NearbyIsReadable(e, 0x40)) continue;
