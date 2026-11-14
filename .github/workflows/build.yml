@@ -1,13 +1,12 @@
-name: Build ProductionAuto DLL
+name: Build MOD DLLs (ProductionAuto + ChestSort)
 
+# 诊断版：把 msbuild 的编译错误逐行打成 GitHub Annotations，
+# 这样不用展开日志也能看到具体是哪一行、哪个 error Cxxxx。
+# 2026-11-14：去掉 branches / paths 限制 —— fork 默认分支常为 main，
+#   写死 master 会导致 push 上去完全不触发；现在任何分支任何 push 都跑。
 on:
   workflow_dispatch:
   push:
-    branches: [ master ]
-    paths:
-      - 'source/ProductionAuto/**'
-      - 'source/QoL_Shared/**'
-      - '.github/workflows/build-productionauto.yml'
 
 jobs:
   build:
@@ -20,10 +19,34 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release x64
-        run: >
-          msbuild source\ProductionAuto\ProductionAuto.vcxproj
-          /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
-          /m /v:minimal
+        id: msbuild
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'msbuild.log'
+          & msbuild source\ProductionAuto\ProductionAuto.vcxproj `
+            /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 `
+            /m /v:minimal 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $errs = @(Get-Content $log | Where-Object {
+            $_ -match 'error\s+[A-Z]{1,3}\d{3,5}|fatal error|MSB\d{3,}|LNK\d{4}|C1\d{3,}'
+          } | Select-Object -First 25)
+          if ($errs.Count -eq 0) {
+            Write-Output "::error::msbuild exit=$code (no error line captured; download msbuild-log artifact)"
+          } else {
+            foreach ($e in $errs) {
+              $line = ($e -replace '[\r\n]', ' ').Trim()
+              Write-Output ("::error::" + $line)
+            }
+          }
+          if ($code -ne 0) { exit $code }
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msbuild-log
+          path: ${{ runner.temp }}/msbuild.log
+          if-no-files-found: ignore
 
       - name: Verify output
         shell: pwsh
@@ -32,9 +55,24 @@ jobs:
           if (-not (Test-Path $dll)) { throw "productionauto.dll was not produced" }
           Get-Item $dll | Select-Object FullName, Length
 
+      - name: Build ChestSort Release x64
+        shell: pwsh
+        run: |
+          & msbuild source\ChestSort\ChestSort.vcxproj `
+            /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 `
+            /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
           name: productionauto
           path: source\bin\x64\Release\productionauto.dll
+          if-no-files-found: error
+
+      - name: Upload ChestSort DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: chestsort
+          path: source\bin\x64\Release\chestsort.dll
           if-no-files-found: error
