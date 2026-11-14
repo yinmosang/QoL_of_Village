@@ -5126,6 +5126,7 @@ static void PaMineYieldPollConfig() {
         p += 5;
         if (strncmp(p, "probe", 5) == 0) mode = 1;
         else if (strncmp(p, "yield", 5) == 0) mode = 2;
+        else if (strncmp(p, "scan", 4) == 0) mode = 3;
     }
     InterlockedExchange(&g_myMode, mode);
 
@@ -5546,13 +5547,134 @@ static void PaMineYieldPayout(void* save, unsigned int layerRem,
         stop ? " STOPPED" : "");
 }
 
+// ============================================================
+// 2026-11-15【矿洞第十一轮·只读校准探针】
+// 目标：把「该发什么 ID」和「本层有哪些矿点」从游戏内存里问出来，
+// 而不是继续猜。全程零写入、零 hook、不改 rem、不发放任何物品。
+// mode=scan 时 100ms 采样背包；进层 / 每次挥镐各 dump 一次 level 对象。
+// ============================================================
+
+// production_hud_v2.inl 在本 inl 之后 include，这里做同签名前置声明；
+// 它把运行时 itemId 翻成中文物品名（MOD 自带的显示用对照表，仅用于校准）。
+static const wchar_t* ProductionItemToName(u64 itemId);
+
+static void PaMyNameUtf8(unsigned long long id, char* out, size_t cap) {
+    if (cap == 0) return;
+    out[0] = 0;
+    const wchar_t* w = ProductionItemToName(static_cast<u64>(id));
+    if (!w) { out[0] = '?'; if (cap > 1) out[1] = 0; return; }
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out,
+                        static_cast<int>(cap), nullptr, nullptr);
+    out[cap - 1] = 0;
+}
+
+// 按「槽索引」逐槽比较，修正第九轮按 itemId 找 prev 的漏报：
+// 同种物品占多个槽、掉落直接入包、换槽等情况都能如实记录。
+static void PaMyScanGain(void* save, unsigned int floor, unsigned int rem) {
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) +
+        NEARBY_PLAYER_ITEMS_OFFSET);
+    if (!NearbyIsReadable(slots, 30 * sizeof(void*))) return;
+    unsigned long long ids[30] = {};
+    int counts[30] = {};
+    for (int i = 0; i < 30; ++i) {
+        void* item = slots[i];
+        if (!item) continue;
+        NearbyItemInfo info = {};
+        if (!NearbyReadItem(item, &info)) continue;
+        ids[i] = info.itemId;
+        counts[i] = info.stackCount;
+    }
+    static unsigned long long s_ids[30] = {};
+    static int s_counts[30] = {};
+    static int s_has = 0;
+    if (s_has) {
+        char name[64] = {};
+        for (int i = 0; i < 30; ++i) {
+            if (!ids[i]) continue;
+            PaMyNameUtf8(ids[i], name, sizeof(name));
+            if (s_ids[i] == 0) {
+                Log("[PA] mine scan: NEW  id=%llu name=%s x%d slot=%d "
+                    "layer=%u rem=%u\n", ids[i], name, counts[i], i,
+                    floor, rem);
+            } else if (ids[i] == s_ids[i] && counts[i] > s_counts[i]) {
+                Log("[PA] mine scan: GAIN id=%llu name=%s +%d (%d->%d) "
+                    "slot=%d layer=%u rem=%u\n", ids[i], name,
+                    counts[i] - s_counts[i], s_counts[i], counts[i], i,
+                    floor, rem);
+            } else if (ids[i] != s_ids[i]) {
+                Log("[PA] mine scan: SWAP id=%llu name=%s slot=%d "
+                    "layer=%u rem=%u\n", ids[i], name, i, floor, rem);
+            }
+        }
+    }
+    memcpy(s_ids, ids, sizeof(ids));
+    memcpy(s_counts, counts, sizeof(counts));
+    s_has = 1;
+}
+
+static void* PaMyReadLevelObj(void* save) {
+    void* lvl = nullptr;
+    if (!PaReadPtr(save, 0x34E8, &lvl) || !lvl) return nullptr;
+    return lvl;
+}
+
+// 进层 / 每次挥镐各 dump 一次：level 对象前 0x1C0 字节 +
+// +0xD0~+0x188 每个像指针的 qword 所指对象前 0x30 字节。
+// 历史第三轮在这里看到 24 个同 vtable 带坐标对象，当时因「敲石头前后
+// 不变」判为静态数据放弃；但对「读本层矿点类型+数量」目标，进层时生成、
+// 敲石头不随之改变的布局表恰恰最可能就在这里，这次要拿到完整字节。
+static void PaMyScanLevel(void* save, unsigned int floor,
+                          unsigned int rem) {
+    static unsigned int s_floor = 0xFFFFFFFFu;
+    static unsigned int s_rem = 0xFFFFFFFFu;
+    const bool enter = (floor != s_floor);
+    const bool hit = (!enter && s_rem != 0xFFFFFFFFu && rem < s_rem);
+    s_floor = floor;
+    s_rem = rem;
+    if (!enter && !hit) return;
+
+    void* lvl = PaMyReadLevelObj(save);
+    if (!lvl) return;
+    unsigned char* b = reinterpret_cast<unsigned char*>(lvl);
+    if (!NearbyIsReadable(b, 0x1C0)) return;
+    unsigned char snap[0x1C0] = {};
+    int snapOk = 0;
+    __try { memcpy(snap, b, 0x1C0); snapOk = 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { snapOk = 0; }
+    if (!snapOk) return;
+
+    Log("[PA] mine scan: LEVEL %s layer=%u rem=%u lvl=%p\n",
+        enter ? "ENTER" : "HIT", floor, rem, lvl);
+    for (int row = 0; row < 28; ++row) {
+        unsigned long long v[2] = {};
+        memcpy(v, snap + row * 16, 16);
+        Log("[PA] mine scan: L+%03X %016llX %016llX\n",
+            row * 16, v[0], v[1]);
+    }
+    for (int off = 0xD0; off <= 0x188; off += 8) {
+        void* p = *reinterpret_cast<void**>(snap + off);
+        if (!p || reinterpret_cast<uintptr_t>(p) < 0x10000) continue;
+        if (!NearbyIsReadable(p, 0x30)) continue;
+        unsigned long long v[6] = {};
+        int ok = 0;
+        __try { memcpy(v, p, 0x30); ok = 1; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+        if (!ok) continue;
+        Log("[PA] mine scan: OBJ +%03X -> %p | %016llX %016llX "
+            "%016llX %016llX %016llX %016llX\n",
+            off, p, v[0], v[1], v[2], v[3], v[4], v[5]);
+    }
+}
+
 static void PaMineYieldTick() {
     PaMineYieldPollConfig();
     const long mode = g_myMode;
     if (!mode) return;
     static unsigned long long s_last = 0;
     const unsigned long long now = GetTickCount64();
-    if (now - s_last < 500ULL) return;
+    const unsigned long long interval = (mode == 3) ? 100ULL : 500ULL;
+    if (now - s_last < interval) return;
     s_last = now;
 
     const uintptr_t exe =
@@ -5572,6 +5694,11 @@ static void PaMineYieldTick() {
     if (mode == 1) {
         PaMyProbeGain(save);
         PaMyProbeDump(save, floor, rem);
+        return;
+    }
+    if (mode == 3) {
+        PaMyScanGain(save, floor, rem);
+        PaMyScanLevel(save, floor, rem);
         return;
     }
     if (mode != 2) return;
