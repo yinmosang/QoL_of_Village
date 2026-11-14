@@ -4516,6 +4516,17 @@ static unsigned long long g_mcA3 = 0;
 static unsigned long long g_mcA4 = 0;
 static unsigned long long g_mcLastKey = 0;
 
+// ===== 第八轮：分帧执行状态 =====
+// detour 只排队；mod_tick 每帧做最多 kBudget 次结算。
+static void* g_mcFrameA1 = nullptr;
+static void* g_mcFrameA2 = nullptr;
+static unsigned long long g_mcFrameA3 = 0;
+static unsigned long long g_mcFrameA4 = 0;
+static volatile long g_mcFramePending = 0;
+static volatile long g_mcFrameValid = 0;
+static volatile long g_mcFrameFailStreak = 0;
+static unsigned long long g_mcFrameStart = 0;  // 排队时刻，250ms 有效窗
+
 // 两个 guard 辅助函数定义在 detour 之后，detour 内同步循环需要提前声明。
 static void PaMineClearGuard(void* a1);
 static void PaMineClearGuardSet(void* a1);
@@ -4579,49 +4590,27 @@ static void __fastcall PaMineClearDetour(void* a1, void* a2,
         Log("[PA] mine clear: swing rem %u -> %u\n", remBefore, remAfter);
     }
 
-    // ===== 第七轮：同步连击 =====
-    // a1/a2 仍在本次挥镐的调用栈上，绝不会被回收 -> 不再有「第 4 次 SEH」。
-    // 第 6 轮异步版把执行放在 mod_tick（100ms 后、旧对象），是失败根因。
+    // ===== 第八轮：只排队，不在此帧结算 =====
+    // 第七轮把 46 次结算全压进一帧 -> 游戏来不及逐帧移除石头对象、
+    // 消化掉落（用户看到「石头没消失」「掉落被自动清除」）。
+    // 这里只登记本次挥镐仍有效的 a1/a2 与待清数量，实际结算交给
+    // mod_tick 每帧做最多 4 次，让游戏获得帧间处理机会。
     if (!g_mcInstalled || g_mcAborted || !g_mcOrig) return;
-    if (InterlockedCompareExchange(&g_mcBusy, 1, 0) != 0) return;
     const long cfg = g_mcExtraCfg;
-    if (cfg != 0 && remAfter > 0 && a1 && a2) {
-        long n = (cfg < 0) ? static_cast<long>(remAfter) : cfg;
-        if (n > 64) n = 64;
-        int done = 0;
-        for (long i = 0; i < n; ++i) {
-            const unsigned int before = PaMineReadRem();
-            if (before == 0) break;   // 本层已清空，别再结算（洞口已生成）
-            PaMineClearGuard(a1);     // 同步模式下清 +0x26C 是实现必需
-            int seh = 0;
-            __try {
-                g_mcOrig(a1, a2, a3, a4);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                seh = 1;
-            }
-            if (seh) {
-                Log("[PA] mine clear: sync SEH at #%ld -> DISABLED\n", i + 1);
-                InterlockedExchange(&g_mcAborted, 1);
-                break;
-            }
-            const unsigned int after = PaMineReadRem();
-            Log("[PA] mine clear: sync #%ld rem %u -> %u left=%ld\n",
-                i + 1, before, after, n - i - 1);
-            if (after >= before) {
-                Log("[PA] mine clear: sync rem did NOT drop -> ABORT, disabled\n");
-                InterlockedExchange(&g_mcAborted, 1);
-                break;
-            }
-            ++done;
-        }
-        if (done > 0) {
-            Log("[PA] mine clear: sync round done=%d rem=%u\n",
-                done, PaMineReadRem());
-        }
-        // 收尾铁律：无论正常/异常/ABORT，都把「本次动作已处理」标志置回 1。
-        // 第 6 轮半途 SEH 把 0 留给游戏，导致镐子举起半天挥不下去。
-        PaMineClearGuardSet(a1);
-    }
+    if (cfg == 0 || remAfter == 0 || !a1 || !a2) return;
+    long n = (cfg < 0) ? static_cast<long>(remAfter) : cfg;
+    if (n > 64) n = 64;
+    if (InterlockedCompareExchange(&g_mcBusy, 1, 0) != 0) return;
+    g_mcFrameA1 = a1;
+    g_mcFrameA2 = a2;
+    g_mcFrameA3 = a3;
+    g_mcFrameA4 = a4;
+    InterlockedExchange(&g_mcFrameFailStreak, 0);
+    InterlockedExchange(&g_mcFramePending, n);
+    InterlockedExchange(&g_mcFrameValid, 1);
+    g_mcFrameStart = GetTickCount64();
+    Log("[PA] mine clear: queued n=%ld rem=%u (frame burst)\n",
+        n, remAfter);
     InterlockedExchange(&g_mcBusy, 0);
 }
 
@@ -4737,9 +4726,74 @@ static void PaMineClearGuardSet(void* a1) {
 static void PaMineClearTick() {
     if (!g_mcInstalled) return;
     PaMineClearPollConfig();
-    // 第七轮：额外调用已在 PaMineClearDetour 内同步执行完毕。
-    // 异步路径彻底移除 —— 旧 a1/a2 在 100ms 后会被回收，是第 6 轮
-    // 「第 4 次 SEH」的根因。这里只保留开关文件的 500ms 热轮询。
+    if (!g_mcFrameValid || g_mcAborted || !g_mcOrig) return;
+    if (InterlockedCompareExchange(&g_mcBusy, 1, 0) != 0) return;
+
+    // a1/a2 有效窗约 300ms；超时立即收手，绝不拿半失效对象继续写游戏状态。
+    if (GetTickCount64() - g_mcFrameStart > 250) {
+        Log("[PA] mine clear: frame window expired -> end round\n");
+        InterlockedExchange(&g_mcFramePending, 0);
+        InterlockedExchange(&g_mcFrameValid, 0);
+        PaMineClearGuardSet(g_mcFrameA1);
+        InterlockedExchange(&g_mcBusy, 0);
+        return;
+    }
+
+    // 每帧最多 4 次：46 块约 12 帧 ≈ 200ms，落在 a1/a2 约 300ms 的
+    // 有效窗口内（第 6 轮实测），同时让游戏逐帧移除石头、消化掉落。
+    const int kBudget = 4;
+    int done = 0;
+    for (int i = 0; i < kBudget; ++i) {
+        const long pending = g_mcFramePending;
+        if (pending <= 0) break;
+        const unsigned int before = PaMineReadRem();
+        if (before == 0) {
+            InterlockedExchange(&g_mcFramePending, 0);
+            break;
+        }
+        PaMineClearGuard(g_mcFrameA1);
+        int seh = 0;
+        __try {
+            g_mcOrig(g_mcFrameA1, g_mcFrameA2, g_mcFrameA3, g_mcFrameA4);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            seh = 1;
+        }
+        if (seh) {
+            Log("[PA] mine clear: frame SEH -> DISABLED\n");
+            InterlockedExchange(&g_mcFramePending, 0);
+            InterlockedExchange(&g_mcFrameValid, 0);
+            InterlockedExchange(&g_mcAborted, 1);
+            break;
+        }
+        const unsigned int after = PaMineReadRem();
+        Log("[PA] mine clear: frame rem %u -> %u left=%ld\n",
+            before, after, pending - 1);
+        if (after >= before) {
+            // 换层 / 敲空地时 rem 不降是正常现象，不该永久禁用功能。
+            const long streak = InterlockedIncrement(&g_mcFrameFailStreak);
+            if (streak >= 2) {
+                Log("[PA] mine clear: frame rem stalled -> end round\n");
+                InterlockedExchange(&g_mcFramePending, 0);
+            } else {
+                InterlockedExchange(&g_mcFramePending, pending - 1);
+            }
+            break;
+        }
+        InterlockedExchange(&g_mcFrameFailStreak, 0);
+        InterlockedExchange(&g_mcFramePending, pending - 1);
+        ++done;
+    }
+
+    // 每帧收尾都把 +0x26C 置回 1，帧间不让游戏看到 0
+    // （第 6 轮「镐子举起半天」就是 0 被留在动作状态机里）。
+    PaMineClearGuardSet(g_mcFrameA1);
+
+    if (g_mcFramePending <= 0) {
+        InterlockedExchange(&g_mcFrameValid, 0);
+        Log("[PA] mine clear: frame round done=%d rem=%u\n",
+            done, PaMineReadRem());
+    }
+    InterlockedExchange(&g_mcBusy, 0);
 }
 
 static void PaInstallMineClearHook() {
