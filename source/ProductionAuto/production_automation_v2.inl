@@ -4301,10 +4301,51 @@ static void PaMineLevelProbeTick(void* save) {
     s_hasPrev = true;
     if (!valid) return;
 
-    // 追踪像堆指针的字段：dump 其指向的前 0x40 字节（最多 10 个）。
-    // 本层石头数组 / 对象链表通常就挂在其中一个指针上。
+    // ---- 第三轮：显式展开 +0x70 / +0x88 两组疑似 std::vector ----
+    // 敲石头瞬间这两个三元组会整体换掉，极可能是本层石头/掉落对象列表。
+    const size_t vecBases[2] = {0x70, 0x88};
+    for (int vi = 0; vi < 2; ++vi) {
+        const size_t bo = vecBases[vi];
+        const unsigned long long vbegin =
+            *reinterpret_cast<const unsigned long long*>(buf + bo);
+        const unsigned long long vend =
+            *reinterpret_cast<const unsigned long long*>(buf + bo + 8);
+        if (vbegin < 0x10000000000ULL || vend < vbegin ||
+            vend > 0x7FFFFFFFFFFFULL) continue;
+        size_t cnt = static_cast<size_t>((vend - vbegin) / 8ULL);
+        if (cnt > 32) cnt = 32;
+        Log("[PA] mine level: VEC +%03X begin=%p end=%p count=%zu\n",
+            static_cast<unsigned>(bo), reinterpret_cast<void*>(vbegin),
+            reinterpret_cast<void*>(vend), cnt);
+        int vecBroken = 0;
+        for (size_t i = 0; i < cnt && !vecBroken; ++i) {
+            unsigned long long elem = 0;
+            __try {
+                memcpy(&elem, reinterpret_cast<const void*>(vbegin + i * 8ULL),
+                       sizeof(elem));
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                vecBroken = 1;
+            }
+            unsigned char ob[0x30] = {};
+            int ok = 0;
+            __try {
+                memcpy(ob, reinterpret_cast<const void*>(elem), sizeof(ob));
+                ok = 1;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                ok = 0;
+            }
+            Log("[PA] mine level:   VEC[%zu] = %p : %016llX %016llX %016llX %s\n",
+                i, reinterpret_cast<void*>(elem),
+                *reinterpret_cast<const unsigned long long*>(ob),
+                *reinterpret_cast<const unsigned long long*>(ob + 8),
+                *reinterpret_cast<const unsigned long long*>(ob + 16),
+                ok ? "" : "(unreadable)");
+        }
+    }
+
+    // ---- 全范围指针追踪（上限 48）+ 二级解引用 ----
     int shown = 0;
-    for (size_t off = 0; off < sizeof(buf) && shown < 10; off += 8) {
+    for (size_t off = 8; off < sizeof(buf) && shown < 48; off += 8) {
         const unsigned long long v =
             *reinterpret_cast<const unsigned long long*>(buf + off);
         if (v < 0x10000000000ULL || v > 0x7FFFFFFFFFFFULL) continue;
@@ -4314,13 +4355,33 @@ static void PaMineLevelProbeTick(void* save) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             continue;
         }
+        const unsigned long long s0 =
+            *reinterpret_cast<const unsigned long long*>(sub);
+        const unsigned long long s1 =
+            *reinterpret_cast<const unsigned long long*>(sub + 8);
+        const unsigned long long s2 =
+            *reinterpret_cast<const unsigned long long*>(sub + 16);
+        const unsigned long long s3 =
+            *reinterpret_cast<const unsigned long long*>(sub + 24);
         Log("[PA] mine level: PTR +%03X -> %p : %016llX %016llX %016llX %016llX\n",
             static_cast<unsigned>(off), reinterpret_cast<void*>(v),
-            *reinterpret_cast<const unsigned long long*>(sub),
-            *reinterpret_cast<const unsigned long long*>(sub + 8),
-            *reinterpret_cast<const unsigned long long*>(sub + 16),
-            *reinterpret_cast<const unsigned long long*>(sub + 24));
+            s0, s1, s2, s3);
         ++shown;
+        const unsigned long long inner[4] = {s0, s1, s2, s3};
+        for (int k = 0; k < 4; ++k) {
+            const unsigned long long w = inner[k];
+            if (w < 0x10000000000ULL || w > 0x7FFFFFFFFFFFULL) continue;
+            unsigned char deep[0x20] = {};
+            __try {
+                memcpy(deep, reinterpret_cast<const void*>(w), sizeof(deep));
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+            Log("[PA] mine level:   DEEP +%03X[%d] -> %p : %016llX %016llX\n",
+                static_cast<unsigned>(off), k, reinterpret_cast<void*>(w),
+                *reinterpret_cast<const unsigned long long*>(deep),
+                *reinterpret_cast<const unsigned long long*>(deep + 8));
+        }
     }
 }
 
