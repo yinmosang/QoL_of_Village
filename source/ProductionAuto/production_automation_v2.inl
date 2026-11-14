@@ -5720,7 +5720,7 @@ static void PaMyVecDump(void* save, unsigned int floor, unsigned int rem) {
             int rok = 0;
             __try {
                 for (size_t j = 0; j < 4 && i + j < show; ++j)
-                    v[j] = reinterpret_cast<unsigned long long>(
+                    v[j] = static_cast<unsigned long long>(
                         reinterpret_cast<uintptr_t>(begin[i + j]));
                 rok = 1;
             } __except (EXCEPTION_EXECUTE_HANDLER) { rok = 0; }
