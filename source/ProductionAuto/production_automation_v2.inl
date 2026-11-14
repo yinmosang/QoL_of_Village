@@ -4516,6 +4516,10 @@ static unsigned long long g_mcA3 = 0;
 static unsigned long long g_mcA4 = 0;
 static unsigned long long g_mcLastKey = 0;
 
+// 两个 guard 辅助函数定义在 detour 之后，detour 内同步循环需要提前声明。
+static void PaMineClearGuard(void* a1);
+static void PaMineClearGuardSet(void* a1);
+
 static void __fastcall PaMineClearDetour(void* a1, void* a2,
                                          unsigned long long a3,
                                          unsigned long long a4) {
@@ -4573,13 +4577,52 @@ static void __fastcall PaMineClearDetour(void* a1, void* a2,
     const unsigned int remAfter = PaMineReadRem();
     if (g_mcInstalled && remBefore != remAfter) {
         Log("[PA] mine clear: swing rem %u -> %u\n", remBefore, remAfter);
-        const long cfg = g_mcExtraCfg;
-        if (cfg != 0 && !g_mcAborted && remAfter > 0) {
-            long n = (cfg < 0) ? static_cast<long>(remAfter) : cfg;
-            if (n > 64) n = 64;
-            InterlockedExchange(&g_mcPending, n);
-        }
     }
+
+    // ===== 第七轮：同步连击 =====
+    // a1/a2 仍在本次挥镐的调用栈上，绝不会被回收 -> 不再有「第 4 次 SEH」。
+    // 第 6 轮异步版把执行放在 mod_tick（100ms 后、旧对象），是失败根因。
+    if (!g_mcInstalled || g_mcAborted || !g_mcOrig) return;
+    if (InterlockedCompareExchange(&g_mcBusy, 1, 0) != 0) return;
+    const long cfg = g_mcExtraCfg;
+    if (cfg != 0 && remAfter > 0 && a1 && a2) {
+        long n = (cfg < 0) ? static_cast<long>(remAfter) : cfg;
+        if (n > 64) n = 64;
+        int done = 0;
+        for (long i = 0; i < n; ++i) {
+            const unsigned int before = PaMineReadRem();
+            if (before == 0) break;   // 本层已清空，别再结算（洞口已生成）
+            PaMineClearGuard(a1);     // 同步模式下清 +0x26C 是实现必需
+            int seh = 0;
+            __try {
+                g_mcOrig(a1, a2, a3, a4);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                seh = 1;
+            }
+            if (seh) {
+                Log("[PA] mine clear: sync SEH at #%ld -> DISABLED\n", i + 1);
+                InterlockedExchange(&g_mcAborted, 1);
+                break;
+            }
+            const unsigned int after = PaMineReadRem();
+            Log("[PA] mine clear: sync #%ld rem %u -> %u left=%ld\n",
+                i + 1, before, after, n - i - 1);
+            if (after >= before) {
+                Log("[PA] mine clear: sync rem did NOT drop -> ABORT, disabled\n");
+                InterlockedExchange(&g_mcAborted, 1);
+                break;
+            }
+            ++done;
+        }
+        if (done > 0) {
+            Log("[PA] mine clear: sync round done=%d rem=%u\n",
+                done, PaMineReadRem());
+        }
+        // 收尾铁律：无论正常/异常/ABORT，都把「本次动作已处理」标志置回 1。
+        // 第 6 轮半途 SEH 把 0 留给游戏，导致镐子举起半天挥不下去。
+        PaMineClearGuardSet(a1);
+    }
+    InterlockedExchange(&g_mcBusy, 0);
 }
 
 static const char* PaMineFindText(const char* h, const char* n) {
@@ -4673,46 +4716,30 @@ static void PaMineClearGuard(void* a1) {
     }
 }
 
+// 把「本次动作已处理」标志置回 1（同步连击收尾用）。
+static void PaMineClearGuardSet(void* a1) {
+    if (!a1) return;
+    void* body = nullptr;
+    __try {
+        body = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(a1) + 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    if (!body) return;
+    __try {
+        *reinterpret_cast<volatile unsigned char*>(
+            reinterpret_cast<unsigned char*>(body) + 0x26C) = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 static void PaMineClearTick() {
     if (!g_mcInstalled) return;
     PaMineClearPollConfig();
-    const long pending = g_mcPending;
-    if (pending <= 0 || g_mcAborted || !g_mcHaveArgs || !g_mcOrig) return;
-    static unsigned long long s_lastCall = 0;
-    const unsigned long long now = GetTickCount64();
-    if (now - s_lastCall < 100) return;
-    const unsigned int remBefore = PaMineReadRem();
-    if (remBefore == 0) {
-        InterlockedExchange(&g_mcPending, 0);
-        return;
-    }
-    s_lastCall = now;
-    if (InterlockedCompareExchange(&g_mcBusy, 1, 0) != 0) return;
-    if (g_mcForceCfg) PaMineClearGuard(g_mcA1);
-
-    int seh = 0;
-    __try {
-        g_mcOrig(g_mcA1, reinterpret_cast<void*>(&g_mcA2[0]), g_mcA3, g_mcA4);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        seh = 1;
-    }
-    InterlockedExchange(&g_mcBusy, 0);
-    if (seh) {
-        InterlockedExchange(&g_mcPending, 0);
-        InterlockedExchange(&g_mcAborted, 1);
-        Log("[PA] mine clear: SEH in extra call -> DISABLED\n");
-        return;
-    }
-    const unsigned int remAfter = PaMineReadRem();
-    Log("[PA] mine clear: extra rem %u -> %u pending=%ld force=%ld\n",
-        remBefore, remAfter, pending - 1, static_cast<long>(g_mcForceCfg));
-    if (remAfter >= remBefore) {
-        InterlockedExchange(&g_mcPending, 0);
-        InterlockedExchange(&g_mcAborted, 1);
-        Log("[PA] mine clear: rem did NOT drop -> ABORT, feature disabled\n");
-    } else {
-        InterlockedExchange(&g_mcPending, pending - 1);
-    }
+    // 第七轮：额外调用已在 PaMineClearDetour 内同步执行完毕。
+    // 异步路径彻底移除 —— 旧 a1/a2 在 100ms 后会被回收，是第 6 轮
+    // 「第 4 次 SEH」的根因。这里只保留开关文件的 500ms 热轮询。
 }
 
 static void PaInstallMineClearHook() {
