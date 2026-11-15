@@ -1644,27 +1644,26 @@ static bool SapTransferSlot(void* player, void* extractorStatus, void* chestStat
             return false;
         }
 
-        // 9b. 时间戳读取成功，先重置 start 时间戳
+        // 9b/9c.【v1.9.19 崩溃修复】清槽只归零 timer，绝不动 itemID/count 键。
+        //   旧实现写 start=nowSec(非 0)、duration 保持原值、itemID{slot}=0、
+        //   count=0，造出「已完成 + timer 双非零 + id=0」幻影槽；游戏主循环
+        //   FUN_1405EFFA0+0x202 查全局产出注册表未命中 -> RDI=0 ->
+        //   0x5F01A2 `mov rax,[rdi]` 读 [0] 崩溃。堆栈全是 village.exe，
+        //   因为崩发生在 MOD 返回之后，SEH 包不住。
+        //   SaveGuard v1.3.18 判据：崩源 = 已完成且(缺 itemID 键 | id=0 |
+        //   id 不在全局注册表)。duration==0 时游戏走早退，不再进崩路；
+        //   下一轮本函数在 start==0 时直接跳过，不会重复收取。
+        //   对齐 save_repair.inl:1741-1744 已验证序列。
         uintptr_t startOff = (uintptr_t)extractorStatus +
                              SAP_STATUS_TIME_VALUE_OFFSET + slot * sizeof(u64);
-        if (IsReadable((void*)startOff, sizeof(u64))) {
-            *(u64*)startOff = (u64)nowSec;
+        uintptr_t durOff = (uintptr_t)extractorStatus +
+                           SAP_STATUS_CREATE_TIME_OFFSET + slot * sizeof(u64);
+        if (IsReadable((void*)startOff, sizeof(u64)) &&
+            IsReadable((void*)durOff, sizeof(u64))) {
+            *(u64*)startOff = 0;
+            *(u64*)durOff = 0;
         }
-
-        // 9c. 再清产出 map 键（此时时间戳已重置，即使后续操作异常也不会不一致）
-        char cntKey[9] = {};
-        _snprintf_s(cntKey, sizeof(cntKey), _TRUNCATE, "count");
-        SapWriteStatusMapValue(extractorStatus, SAP_STATUS_ITEMVAL_MAP_OFFSET,
-                               cntKey, 0, true);
-        if (slot > 0) {
-            _snprintf_s(cntKey, sizeof(cntKey), _TRUNCATE, "count%zu", slot);
-            SapWriteStatusMapValue(extractorStatus, SAP_STATUS_ITEMVAL_MAP_OFFSET,
-                                   cntKey, 0, true);
-        }
-        char idKey[8] = {};
-        _snprintf_s(idKey, sizeof(idKey), _TRUNCATE, "itemID%zu", slot);
-        SapWriteStatusMapValue(extractorStatus, SAP_STATUS_ITEMID_MAP_OFFSET,
-                               idKey, 0, false);
+        // 不再调用 SapWriteStatusMapValue 写 count / count{slot} / itemID{slot}。
     }
 
     // 10. 调用原生 sapStatusEventNotify 触发游戏自身的状态转换
@@ -2418,6 +2417,66 @@ extern "C" __declspec(dllexport) int QolQuickMenuItems(
 // ============================================================
 // 插件入口
 // ============================================================
+// ============================================================
+// v1.9.19【崩溃点硬化】游戏 FUN_1405EFFA0 (0x5EFFA0) 加工完成路径
+//   +0x202 处：全局产出注册表查不到 id 时 JZ 跳过 LEA RDI，RDI=0，
+//   0x5F01A2 `mov rax,[rdi]` 读 [0] -> 0xC0000005。
+//   校验 18 字节签名 + 跳转目标 (XOR EAX,EAX) 后，把 JZ +4 改成
+//   JZ +0x3D，让未命中改走 return 0。纯运行时内存补丁，**不写存档**，
+//   每次启动重新打；与 SaveGuard v1.3.18 硬化表逐字节同源。
+//   用途：兜住本 MOD 旧版已经写进存档的幻影槽，修复版上线后立刻不再崩。
+// ============================================================
+static void SapInstallCrashGuard() {
+    const uintptr_t base =
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    static const unsigned char kSig[18] = {
+        0x4C, 0x8B, 0x44, 0x24, 0x20,   // MOV R8,[RSP+0x20]
+        0x4D, 0x3B, 0x43, 0x60,         // CMP R8,[R11+0x60]
+        0x74, 0x04,                     // JZ +4   <- 待改
+        0x49, 0x8D, 0x78, 0x18,         // LEA RDI,[R8+0x18]
+        0x48, 0x8B, 0x07,               // MOV RAX,[RDI]
+    };
+    unsigned char* sigBase =
+        reinterpret_cast<unsigned char*>(base + 0x5F0193);
+    unsigned char* site =
+        reinterpret_cast<unsigned char*>(base + 0x5F019C);
+    unsigned char* ret0 =
+        reinterpret_cast<unsigned char*>(base + 0x5F01DB);
+    if (!IsReadable(sigBase, sizeof(kSig)) || !IsReadable(ret0, 2)) {
+        Log("[AutoHarvest] [guard] 地址不可读 -> 跳过硬化\n");
+        return;
+    }
+    if (site[0] == 0x74 && site[1] == 0x3D) {
+        Log("[AutoHarvest] [guard] 崩溃点已硬化（补丁在位）\n");
+        return;
+    }
+    for (size_t i = 0; i < sizeof(kSig); ++i) {
+        if (i == 9 || i == 10) continue;   // siteOff = 0x5F019C - 0x5F0193
+        if (sigBase[i] != kSig[i]) {
+            Log("[AutoHarvest] [guard] 签名不符 +%zu -> 跳过硬化\n", i);
+            return;
+        }
+    }
+    if (site[0] != 0x74 || site[1] != 0x04 ||
+        ret0[0] != 0x33 || ret0[1] != 0xC0) {
+        Log("[AutoHarvest] [guard] 原字节/跳转目标非预期 -> 跳过硬化\n");
+        return;
+    }
+    DWORD oldProt = 0;
+    if (!VirtualProtect(site, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        Log("[AutoHarvest] [guard] VirtualProtect 失败 err=%lu\n",
+            GetLastError());
+        return;
+    }
+    site[0] = 0x74;
+    site[1] = 0x3D;
+    DWORD restored = 0;
+    VirtualProtect(site, 2, oldProt, &restored);
+    FlushInstructionCache(GetCurrentProcess(), site, 2);
+    Log("[AutoHarvest] [guard] 崩溃点硬化完成 %s\n",
+        (site[0] == 0x74 && site[1] == 0x3D) ? "OK" : "FAILED");
+}
+
 extern "C" __declspec(dllexport) void mod_init(void) {
     LogOpen("autoharvest");
     qol::obs::Init(nullptr);   // 统一 HUD 观测层：首 DLL 建共享映射 + 浮层窗口
@@ -2433,6 +2492,8 @@ extern "C" __declspec(dllexport) void mod_init(void) {
 
     G::base = (uintptr_t)GetModuleHandleW(nullptr);
     Log("[AutoHarvest] 游戏基址: 0x%llX", (unsigned long long)G::base);
+    // v1.9.19：先挡住旧版已写进存档的幻影槽造成的原生空崩（纯内存补丁）
+    SapInstallCrashGuard();
 
     // AOB 扫描定位游戏函数
     uintptr_t addrs[kAOBCount] = {};
