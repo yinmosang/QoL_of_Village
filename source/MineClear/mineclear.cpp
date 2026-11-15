@@ -76,12 +76,49 @@ static volatile long g_enabled  = 1;
 static volatile long g_mul      = 3;
 static volatile long g_idCount  = 0;
 static volatile WORD g_hotkeyVk = VK_F8;
+// 两个可热调旋钮：scanms= 放大扫描间隔（默认 250ms），
+// refresh= 是否调用原生三件套刷新（默认 1）。用于零编译定位性能问题。
+static volatile long g_scanMs   = 250;
+static volatile long g_refresh  = 1;
 static u64  g_ids[16]   = {};
 static long g_idMul[16] = {};
 
 // ============================================================
-// 基础读取工具（VirtualQuery 版，单区域即可覆盖所有小结构）
+// 基础读取工具（已提交区域缓存版）
+//
+// 【掉帧根因 / 2026-11-15 第十八轮】
+// ProductionAuto 的 NearbyIsReadable 带 256 项区域缓存，绝大多数检查
+// 只是一次整数比较。拆分版早期这里每次都直接调 VirtualQuery：
+//   30 个背包槽 x 每槽 5 次可读性检查 = 150 次 / 次扫描
+//   旧 DLL 每 100ms 扫一次 => 1500 次 VirtualQuery / 秒
+// 该游戏进程堆区域多、VAD 树大，VirtualQuery 极慢（历史上 F7 遍历
+// 2502 个节点耗时 3.4~3.8 秒就是同一个 API），足以把主线程吃满。
+// 这就解释了「开倍增就卡爆、关掉就正常 / 矿洞内巨卡」。
+//
+// 现在：缓存命中只做两次整数比较，未命中才 VirtualQuery 一次并登记
+// 整段已提交区域（物品对象通常集中在 1~3 个堆区域里）。
 // ============================================================
+struct ReadRegion {
+    uintptr_t begin;
+    uintptr_t end;
+};
+static ReadRegion g_regions[64] = {};
+static long       g_regionCount = 0;
+static ULONGLONG  g_regionEpoch = 0;
+static long       g_vqCount     = 0;   // 真实 VirtualQuery 次数（PERF 诊断）
+static long       g_cacheHits   = 0;   // 缓存命中次数（PERF 诊断）
+static long       g_scanCount   = 0;   // 背包逐槽扫描次数（PERF 诊断）
+
+// 每 30 秒重建缓存，避免页面被释放后仍按陈旧区域放行。
+// 只在每次 tick 开头调一次，热路径里不出现任何系统调用。
+static void RegionTick() {
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_regionEpoch > 30000ULL) {
+        g_regionEpoch = now;
+        g_regionCount = 0;
+    }
+}
+
 static void* Rva(uintptr_t rva) {
     return reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + rva);
@@ -91,14 +128,31 @@ static bool Readable(const void* p, size_t n) {
     if (!p || n == 0) return false;
     const uintptr_t start = reinterpret_cast<uintptr_t>(p);
     if (start < 0x10000) return false;
+    const uintptr_t end = start + n;
+    if (end < start) return false;
+
+    for (long i = 0; i < g_regionCount; ++i) {
+        if (start >= g_regions[i].begin && end <= g_regions[i].end) {
+            ++g_cacheHits;
+            return true;
+        }
+    }
+
+    ++g_vqCount;
     MEMORY_BASIC_INFORMATION mbi = {};
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
     if (mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-    const uintptr_t end = start + n;
-    const uintptr_t regionEnd =
-        reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return end >= start && end <= regionEnd;
+    const uintptr_t regionBegin =
+        reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t regionEnd = regionBegin + mbi.RegionSize;
+    if (end > regionEnd) return false;
+    if (g_regionCount < 64) {
+        g_regions[g_regionCount].begin = regionBegin;
+        g_regions[g_regionCount].end = regionEnd;
+        ++g_regionCount;
+    }
+    return true;
 }
 
 static bool ReadPtr(const void* base, uintptr_t off, void** out) {
@@ -261,6 +315,16 @@ static void PollConfig() {
     p = Find(buf, "hotkey=");
     if (p) g_hotkeyVk = ParseVk(p + 7);
 
+    p = Find(buf, "scanms=");
+    if (p) {
+        long ms = static_cast<long>(ParseU64(p + 7));
+        if (ms < 100) ms = 100;
+        if (ms > 2000) ms = 2000;
+        InterlockedExchange(&g_scanMs, ms);
+    }
+    p = Find(buf, "refresh=");
+    if (p) InterlockedExchange(&g_refresh, ParseU64(p + 8) ? 1 : 0);
+
     // ids= 支持 id 或 id@倍率；不写则沿用内置 4 种
     p = Find(buf, "ids=");
     if (p) {
@@ -346,6 +410,7 @@ static void PollHotkey() {
 // 核心：只放大游戏原生掉进背包的白名单物品
 // ============================================================
 static void BoostTick() {
+    RegionTick();
     void* save = GetSave();
     if (!save) return;
     unsigned int floor = 0;
@@ -353,31 +418,46 @@ static void BoostTick() {
     if (!ReadLevel(save, &floor, &rem)) return;
     if (floor == 0 || floor > 200 || rem >= 0xFFFF0000u) return;
 
-    // 【性能】只在「挥镐（rem 变化）后 30 秒」窗口内逐槽扫描背包。
-    // 旧实现每 100ms 无条件扫 30 个槽（约 150 次 VirtualQuery / 100ms），
-    // 在矿洞里会和其它矿洞 MOD 的轮询叠加。现在平时只读 level 的几个字节，
-    // 几乎零开销；掉落进包后 stackCount 会保持，250ms 轮询不会漏算增量。
-    static unsigned int s_lastRem = 0xFFFFFFFFu;
-    static ULONGLONG s_hitAt = 0;
-    const ULONGLONG nowMs = GetTickCount64();
-    if (rem != s_lastRem) {
-        s_lastRem = rem;
-        s_hitAt = nowMs;
-    }
-    if (s_hitAt == 0 || nowMs - s_hitAt > 30000ULL) return;
-
-    void** slots = reinterpret_cast<void**>(
-        reinterpret_cast<unsigned char*>(save) + kOffBag);
-    if (!Readable(slots, 30 * sizeof(void*))) return;
-
+    // 【性能 / 第十八轮】绝不无条件扫背包。
+    // level 对象是常驻的，矿洞外 floor 也可能读到非 0；旧版只要 floor>0
+    // 就每 100ms 扫一次 30 槽，于是「矿洞外小卡、进矿洞巨卡」。
+    // 现在只认「rem 下降」= 真正敲掉了石头才开一个 20 秒窗口：
+    // 首次读到 / 换层只建基线不开窗；户外 rem 恒定 -> 永不扫描。
     static u64 s_ids[30] = {};
     static int s_counts[30] = {};
     static bool s_has = false;
     static unsigned int s_floor = 0;
-    if (floor != s_floor) {   // 换层重建基线，避免把整包变化误判为掉落
+    static unsigned int s_lastRem = 0xFFFFFFFFu;
+    static ULONGLONG s_hitAt = 0;
+    static ULONGLONG s_lastRefresh = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+
+    if (floor != s_floor) {   // 换层：重建背包基线 + rem 基线，本拍不扫描
         s_floor = floor;
         s_has = false;
+        s_lastRem = rem;
+        s_hitAt = 0;
+        return;
     }
+    if (s_lastRem == 0xFFFFFFFFu) {   // 首次读到：只建基线
+        s_lastRem = rem;
+        return;
+    }
+    if (rem < s_lastRem) {            // 敲掉了石头 -> 开窗
+        s_lastRem = rem;
+        s_hitAt = nowMs;
+    } else if (rem > s_lastRem) {     // rem 回升（换层等）：重建两条基线
+        s_lastRem = rem;
+        s_hitAt = 0;
+        s_has = false;
+        return;
+    }
+    if (s_hitAt == 0 || nowMs - s_hitAt > 20000ULL) return;
+
+    void** slots = reinterpret_cast<void**>(
+        reinterpret_cast<unsigned char*>(save) + kOffBag);
+    if (!Readable(slots, 30 * sizeof(void*))) return;
+    ++g_scanCount;
 
     u64 ids[30] = {};
     int counts[30] = {};
@@ -452,7 +532,28 @@ static void BoostTick() {
 
     memcpy(s_ids, ids, sizeof(ids));
     memcpy(s_counts, counts, sizeof(counts));
-    if (boosted > 0) SafeRefresh(save);
+    // 三件套重算降频：窗口内最多每秒一次；refresh=0 可零编译整体关闭，
+    // 便于隔离「到底是背包扫描还是原生刷新」造成的卡顿。
+    if (boosted > 0 && g_refresh &&
+        nowMs - s_lastRefresh > 1000ULL) {
+        s_lastRefresh = nowMs;
+        SafeRefresh(save);
+    }
+}
+
+// 每 5 秒一行诊断：编译后可把 qol_log.cfg 临时设 level=1，
+// 用 vq（真实 VirtualQuery 次数）确认缓存是否生效。level=0 时
+// Log() 第一行就 return，这里只剩几个整数自增，无开销。
+static void PerfLog() {
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_last < 5000ULL) return;
+    s_last = now;
+    Log("[MineClear] PERF scans=%ld vq=%ld cacheHits=%ld regions=%ld\n",
+        g_scanCount, g_vqCount, g_cacheHits, g_regionCount);
+    g_scanCount = 0;
+    g_vqCount = 0;
+    g_cacheHits = 0;
 }
 
 // ============================================================
@@ -515,10 +616,12 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
     }
     PollHotkey();
     PollConfig();
+    PerfLog();
     if (!g_enabled) return;
     static ULONGLONG s_last = 0;
     const ULONGLONG now = GetTickCount64();
-    if (now - s_last < 250ULL) return;   // 250ms：降低 level 轮询频率
+    const ULONGLONG interval = static_cast<ULONGLONG>(g_scanMs);
+    if (now - s_last < interval) return;   // 默认 250ms，可用 scanms= 热调
     s_last = now;
     BoostTick();
 }
