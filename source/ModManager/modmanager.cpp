@@ -700,6 +700,50 @@ static int  g_recNextSel = 0;    // 选择阶段：0=下一个 1=删除 2=结束
 static bool g_recNextRelease = true;  // 选择阶段手柄边沿触发
 static bool g_recGpWait = false;     // 捕获阶段手柄防抖：进入捕获后先等待所有按键松开
 static bool g_recKbWait = false;     // 捕获阶段键盘防抖：进入捕获后先等待所有按键松开
+
+// ============================================================
+// v1.2.27【键盘改键根治】录制期间临时安装 WH_KEYBOARD_LL
+// 旧版只靠 GetAsyncKeyState 轮询：面板是 WS_EX_NOACTIVATE 窗口，
+// PumpPanel 又只泵 g_panel 自己的消息；在 Steam Input / Raw Input /
+// 焦点被游戏独占等环境下，异步键状态表可能完全读不到物理按键，
+// 表现为「手柄能录、键盘永远读不到」。低级键盘钩子由系统按 keydown
+// 边沿投递，不依赖窗口焦点和消息泵过滤，是最可靠的捕获源。
+// 只在录制期间安装，录制结束 / 面板关闭 / DLL 卸载立即卸载 -> 平时零开销。
+// ============================================================
+static HHOOK s_recKbHook = nullptr;
+static volatile long s_recHookVk = -1;     // 钩子捕获的 VK（-1 = 无）
+static volatile long s_recHookStart = 0;   // 安装时刻（忽略残留旧键）
+
+static LRESULT CALLBACK RecKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION &&
+        (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        // 安装后 250ms 内的 keydown 视为「进入录制时正按着的旧键」，忽略
+        if ((long)(GetTickCount() - (DWORD)s_recHookStart) >= 250) {
+            const KBDLLHOOKSTRUCT* p =
+                reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+            if (p && p->vkCode < 256)
+                InterlockedExchange(&s_recHookVk, (long)p->vkCode);
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+static void RecKbHookInstall() {
+    InterlockedExchange(&s_recHookVk, -1);
+    InterlockedExchange(&s_recHookStart, (long)GetTickCount());
+    if (s_recKbHook) return;
+    s_recKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, RecKeyboardProc,
+                                    g_module, 0);
+    Log("[ModManager] kb hook install=%d\n", s_recKbHook ? 1 : 0);
+}
+
+static void RecKbHookRemove() {
+    if (s_recKbHook) {
+        UnhookWindowsHookEx(s_recKbHook);
+        s_recKbHook = nullptr;
+    }
+    InterlockedExchange(&s_recHookVk, -1);
+}
 static RECT g_keyRects[32][7];   // 各 MOD 各按键标签 + 改键按钮 的命中矩形（绘制时填充）
 
 // 手柄状态
@@ -794,7 +838,54 @@ static void VkToName(WORD vk, wchar_t* out, int outLen);  // 前置于下方使�
 static void PollKeyboardForRecording() {
     if (g_recModIdx < 0) return;       // 未在录制
     if (g_recStage != 0) return;       // 选择阶段不捕获
-    if (g_gamepadCaptured) return;     // 手柄优先：手柄正在捕获时不抢键
+
+    // v1.2.27【钩子优先】拿到 keydown 边沿直接写盘，完全绕开
+    // GetAsyncKeyState（该路径在部分环境读不到物理按键）。
+    // PumpPanel 只泵 g_panel 自己的消息；这里主动泵一次（PM_NOREMOVE
+    // 不移除任何消息），让 WH_KEYBOARD_LL 回调有机会在本线程派发。
+    if (s_recKbHook) {
+        MSG hookMsg = {};
+        PeekMessageW(&hookMsg, nullptr, 0, 0, PM_NOREMOVE);
+    }
+    const long hookVk = InterlockedExchange(&s_recHookVk, -1);
+    if (hookVk >= 0) {
+        if (hookVk == VK_ESCAPE) { CancelRecordKey(); return; }
+        if (hookVk == VK_SHIFT || hookVk == VK_CONTROL || hookVk == VK_MENU ||
+            hookVk == VK_LWIN || hookVk == VK_RWIN) return;
+        const int modIdx = g_recModIdx;
+        const int keyIdx = g_recKeyIdx;
+        wchar_t name[32] = {};
+        VkToName((WORD)hookVk, name, 32);
+        if (modIdx >= 0 && modIdx < g_modCount &&
+            keyIdx >= 0 && keyIdx < g_mods[modIdx].hotkeyCount) {
+            wcscpy_s(g_mods[modIdx].hotkeys[keyIdx], name);
+            std::wstring joined;
+            for (int h = 0; h < g_mods[modIdx].hotkeyCount; ++h) {
+                if (h > 0) joined += L", ";
+                joined += g_mods[modIdx].hotkeys[h];
+            }
+            static wchar_t s_hookHkBuf[128] = {};
+            wcscpy_s(s_hookHkBuf, joined.c_str());
+            g_mods[modIdx].hotkey = s_hookHkBuf;
+            WriteHotkeysFile(modIdx);
+            Log("[ModManager] kb hook recorded: mod=%d key=%ls vk=%d\n",
+                modIdx, name, (int)hookVk);
+        }
+        g_capturedVk = -1;
+        RecordKeyWritten();
+        return;
+    }
+
+    // v1.2.27：键盘优先，手柄捕获状态不再阻挡键盘
+    // 诊断：每 2 秒一行，level=0 时 Log 首行即 return，零开销
+    static ULONGLONG s_recDiagAt = 0;
+    const ULONGLONG diagNow = GetTickCount64();
+    if (diagNow - s_recDiagAt > 2000ULL) {
+        s_recDiagAt = diagNow;
+        Log("[ModManager] rec diag: kbWait=%d captured=%d hook=%d hookVk=%ld\n",
+            (int)g_recKbWait, g_capturedVk, s_recKbHook ? 1 : 0,
+            s_recHookVk);
+    }
 
     if (g_capturedVk >= 0) {
         // 已捕获某键，等其松开 → 写入
@@ -2302,8 +2393,9 @@ static void BeginRecordKey(int modIdx, int keyIdx) {
     g_recKbWait = true;        // 等待键盘全部松开，避免录到进入时的键
     g_capturedVk = -1;
     g_gamepadCaptured = nullptr;
-    Log("[ModManager] record start: mod=%ls key=%d\n",
-        g_mods[modIdx].folder, keyIdx);
+    RecKbHookInstall();   // v1.2.27：录制开始装全局键盘钩子
+    Log("[ModManager] record start: mod=%ls key=%d kbhook=%d\n",
+        g_mods[modIdx].folder, keyIdx, s_recKbHook ? 1 : 0);
     SetCapture(g_panel);   // 捕获鼠标，便于 ESC 取消
     InvalidateRect(g_panel, nullptr, FALSE);
 }
@@ -2331,6 +2423,7 @@ static void RecordNext() {
         g_recKbWait = true;    // 防抖：等待键盘全部松开再接受输入
         g_capturedVk = -1;
         g_gamepadCaptured = nullptr;
+        RecKbHookInstall();   // v1.2.27：下一槽位重新武装钩子
         InvalidateRect(g_panel, nullptr, FALSE);
     } else {
         CancelRecordKey();
@@ -2339,6 +2432,7 @@ static void RecordNext() {
 
 // 取消录制
 static void CancelRecordKey() {
+    RecKbHookRemove();   // v1.2.27：录制结束立即卸载钩子
     if (g_recModIdx >= 0 && GetCapture() == g_panel) ReleaseCapture();
     g_recModIdx = -1;
     g_recKeyIdx = -1;
@@ -4223,6 +4317,7 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
 }
 
 extern "C" __declspec(dllexport) void unload(void) {
+    RecKbHookRemove();   // v1.2.27：DLL 卸载前确保钩子已摘除
     Log("[ModManager] unload\n");
     ShutdownGamepad();
     if (g_quickMenu && IsWindow(g_quickMenu)) {
