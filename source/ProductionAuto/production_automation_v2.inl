@@ -133,10 +133,11 @@ static volatile int g_paDumpKeys = 0;
 //   只读诊断：不写任何内存、不动任何物品。用于定位 gimmick_collection_machine
 //   的 status 结构与产出存放位置（它不在配方表也不是箱子，正常枚举会丢弃它）。
 static volatile int g_paRancherProbe = 0;
-// 2026-11-14【畜产品回收机自动回收】qol_pa_rancher_auto.txt 存在时开启。
+// 2026-11-14【畜产品回收机自动回收】2026-11-15 起改由独立 MOD 文件夹
+//   Mods\RancherAuto_v1.0.0\ 是否存在控制（ModManager 面板单独开关）。
 //   把每台 gimmick_collection_machine 的 items vector 产出原子转移到
 //   全场任意箱子的同类堆/空槽（跨房间、跨地图，整场一次枚举到齐）。
-//   默认关闭：不放该文件就不写任何物品，删文件即完全恢复，无需重编。
+//   默认关闭：文件夹移出 Mods\ 就不写任何物品，移回即恢复。
 static volatile int g_paRancherAuto = 0;
 // 2026-11-14【收集册探针】qol_pa_collection_probe.txt 存在时开启。
 //   只读追踪 save 前 0x4000 字节的变化，用于定位「图鉴登记位」；
@@ -6521,7 +6522,7 @@ static bool PaIsOrthoNeighbor(float x1, float y1, float x2, float y2) {
 //   红线：写箱成功 + 清槽失败 = 复制。
 //     ⇒ 顺序固定「先 CAS 摘除 → 再写箱(读回验证) → 失败 CAS 回滚原槽」。
 //       摘除失败就整轮不动，绝不出现两处同时持有同一物品。
-//   开关：qol_pa_rancher_auto.txt 存在才运行；删文件即恢复。
+//   开关：Mods\RancherAuto_v1.0.0\ 存在才运行；移出即恢复。
 // ============================================================
 
 // 把已「摘除」的 item 放进全场任意箱子。
@@ -7813,6 +7814,42 @@ static void PaTick(const PaWorldContext* ctx) {
         }
         g_paAutomationPaused = s_paused;
     }
+    // 2026-11-15【独立 MOD 开关】畜产品回收机自动回收改由
+    //   Mods\RancherAuto_v1.0.0\ 文件夹是否存在控制。这与 ModManager 的
+    //   ScanToggleState() 完全同构：文件夹在 Mods\ = 开，被面板移到
+    //   待用MOD\ = 关。文件夹里的 modinfo.txt 会被 DiscoverExternalMods()
+    //   自动登记成独立开关条目（无需 DLL、无需改 ModManager）。
+    //   500ms 热轮询，顺带解决旧开关「只在首次 PaTick 读一次、改了要重启」。
+    //   注意：功能本体 / gimmick 枚举 / 物品转移链一行未动。
+    {
+        static ULONGLONG s_lastRancherPoll = 0;
+        static int s_lastRancherState = -1;
+        const ULONGLONG nowR = GetTickCount64();
+        if (nowR - s_lastRancherPoll >= 500ULL) {
+            s_lastRancherPoll = nowR;
+            wchar_t rdir[MAX_PATH] = {};
+            if (GetModuleFileNameW(nullptr, rdir, MAX_PATH)) {
+                wchar_t* rslash = wcsrchr(rdir, L'\\');
+                if (rslash) {
+                    *(rslash + 1) = 0;
+                    wchar_t rp[MAX_PATH] = {};
+                    wcscpy_s(rp, MAX_PATH, rdir);
+                    wcscat_s(rp, MAX_PATH, L"Mods\\RancherAuto_v1.0.0");
+                    const DWORD ra = GetFileAttributesW(rp);
+                    const int state =
+                        (ra != INVALID_FILE_ATTRIBUTES &&
+                         (ra & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+                    g_paRancherAuto = state;
+                    if (state != s_lastRancherState) {
+                        s_lastRancherState = state;
+                        Log("[PA] rancher auto switch -> %d "
+                            "(Mods\\RancherAuto_v1.0.0 %s)\n",
+                            state, state ? "present" : "absent");
+                    }
+                }
+            }
+        }
+    }
     // v1.5.46-diag：两个诊断 flag（启动后首次 PaTick 读取一次）
     {
         static int s_diagChecked = 0;
@@ -7845,9 +7882,11 @@ static void PaTick(const PaWorldContext* ctx) {
                         (GetFileAttributesW(p5) != INVALID_FILE_ATTRIBUTES);
                     wchar_t p7[MAX_PATH] = {};
                     wcscpy_s(p7, MAX_PATH, dir);
-                    wcscat_s(p7, MAX_PATH, L"qol_pa_rancher_auto.txt");
+                    wcscat_s(p7, MAX_PATH, L"Mods\\RancherAuto_v1.0.0");
+                    const DWORD rancherDirAttr = GetFileAttributesW(p7);
                     g_paRancherAuto =
-                        (GetFileAttributesW(p7) != INVALID_FILE_ATTRIBUTES);
+                        (rancherDirAttr != INVALID_FILE_ATTRIBUTES &&
+                         (rancherDirAttr & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
                     wchar_t p8[MAX_PATH] = {};
                     wcscpy_s(p8, MAX_PATH, dir);
                     wcscat_s(p8, MAX_PATH, L"qol_pa_collection_probe.txt");
