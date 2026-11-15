@@ -353,6 +353,19 @@ static void BoostTick() {
     if (!ReadLevel(save, &floor, &rem)) return;
     if (floor == 0 || floor > 200 || rem >= 0xFFFF0000u) return;
 
+    // 【性能】只在「挥镐（rem 变化）后 30 秒」窗口内逐槽扫描背包。
+    // 旧实现每 100ms 无条件扫 30 个槽（约 150 次 VirtualQuery / 100ms），
+    // 在矿洞里会和其它矿洞 MOD 的轮询叠加。现在平时只读 level 的几个字节，
+    // 几乎零开销；掉落进包后 stackCount 会保持，250ms 轮询不会漏算增量。
+    static unsigned int s_lastRem = 0xFFFFFFFFu;
+    static ULONGLONG s_hitAt = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (rem != s_lastRem) {
+        s_lastRem = rem;
+        s_hitAt = nowMs;
+    }
+    if (s_hitAt == 0 || nowMs - s_hitAt > 30000ULL) return;
+
     void** slots = reinterpret_cast<void**>(
         reinterpret_cast<unsigned char*>(save) + kOffBag);
     if (!Readable(slots, 30 * sizeof(void*))) return;
@@ -401,10 +414,8 @@ static void BoostTick() {
                 break;
             }
         }
-        if (mul <= 0) {
-            Log("[MineClear] PASS id=%llu +%d (not in ids=)\n", ids[i], delta);
-            continue;
-        }
+        // 非白名单零写入；不再逐条打 PASS 日志（诊断日志开着时会刷屏）
+        if (mul <= 0) continue;
         if (mul > 20) mul = 20;
 
         ItemInfo before = {};
@@ -507,7 +518,7 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
     if (!g_enabled) return;
     static ULONGLONG s_last = 0;
     const ULONGLONG now = GetTickCount64();
-    if (now - s_last < 100ULL) return;
+    if (now - s_last < 250ULL) return;   // 250ms：降低 level 轮询频率
     s_last = now;
     BoostTick();
 }
