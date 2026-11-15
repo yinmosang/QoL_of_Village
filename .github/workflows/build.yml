@@ -1,4 +1,4 @@
-name: Build MOD DLLs (ProductionAuto + ChestSort)
+name: Build MOD DLLs (ProductionAuto + ChestSort + MineClear)
 
 # 诊断版：把 msbuild 的编译错误逐行打成 GitHub Annotations，
 # 这样不用展开日志也能看到具体是哪一行、哪个 error Cxxxx。
@@ -75,4 +75,26 @@ jobs:
         with:
           name: chestsort
           path: source\bin\x64\Release\chestsort.dll
+          if-no-files-found: error
+
+      - name: Build MineClear Release x64
+        shell: pwsh
+        run: |
+          & msbuild source\MineClear\MineClear.vcxproj `
+            /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 `
+            /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify MineClear output
+        shell: pwsh
+        run: |
+          $dll = "source\bin\x64\Release\mineclear.dll"
+          if (-not (Test-Path $dll)) { throw "mineclear.dll was not produced" }
+          Get-Item $dll | Select-Object FullName, Length
+
+      - name: Upload MineClear DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: mineclear
+          path: source\bin\x64\Release\mineclear.dll
           if-no-files-found: error
