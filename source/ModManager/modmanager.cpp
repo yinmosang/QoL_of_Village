@@ -826,12 +826,21 @@ static void PollKeyboardForRecording() {
 
     // 防抖：进入捕获后，先等所有键松开，避免录到"进入录制时正按着的旧键"
     if (g_recKbWait) {
+        // v1.2.26：排除修饰键（粘滞的 Shift/Ctrl/Alt/Win 会让防抖永远不通过），
+        //   并加 1 秒超时保险，避免任何常按虚拟键把键盘录制永久卡死。
+        static ULONGLONG s_kbWaitAt = 0;
+        if (s_kbWaitAt == 0) s_kbWaitAt = GetTickCount64();
+        bool allUp = true;
         for (int vk = 1; vk < 256; ++vk) {
             if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON ||
-                vk == VK_XBUTTON1 || vk == VK_XBUTTON2) continue;
-            if (GetAsyncKeyState(vk) & 0x8000) return;  // 还有键按住，继续等
+                vk == VK_XBUTTON1 || vk == VK_XBUTTON2 ||
+                vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+                vk == VK_LWIN || vk == VK_RWIN) continue;
+            if (GetAsyncKeyState(vk) & 0x8000) { allUp = false; break; }
         }
+        if (!allUp && GetTickCount64() - s_kbWaitAt < 1000ULL) return;
         g_recKbWait = false;
+        s_kbWaitAt = 0;
     }
 
     // Esc = 取消录制
@@ -4195,8 +4204,12 @@ extern "C" __declspec(dllexport) void mod_tick(void) {
     PollQuickMenu();
     // 改键录制轮询（面板可见且正在录制时）
     if (g_panelVisible && g_recModIdx >= 0) {
-        PollGamepadForRecording();
+        // v1.2.26【键盘改键修复】旧版手柄轮询先跑：只要手柄有任意状态就
+        //   立刻写盘并进入选择阶段，键盘录制被 g_recStage != 0 挡在门外，
+        //   表现为「改键只能录到手柄、键盘按键读不到」。改为键盘优先；
+        //   没按键盘时 PollKeyboardForRecording 直接 return，手柄仍可用。
         PollKeyboardForRecording();
+        PollGamepadForRecording();
     }
     // 手柄面板导航轮询（面板可见时）
     if (g_panelVisible) {
