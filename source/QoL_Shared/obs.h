@@ -29,6 +29,8 @@
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>   // 2026-11-24 toast 热键解析：atoi
+#include <cctype>    // 2026-11-24 toast 热键解析：toupper
 #include "game_window.h"   // KB-113: toast 必须锚游戏客户区，禁用全屏坐标
 
 // _countof 兜底：部分 MOD 的编译单元未间接引入 <stdlib.h>（_countof 定义处），
@@ -147,11 +149,63 @@ inline void SetStr(const char* mod, const char* key, const wchar_t* v) {
     }
 }
 
+// ============================================================
+// 2026-11-24【toast 总开关】F10 热键切换整个提示浮层的显示/隐藏
+//   需求：截图里"收割完成"这类提示 By 所有 MOD 共用同一个浮层，要一个热键
+//   整体开关。关键约束：状态必须跨 DLL 共享，但**绝不能改 QolObsShm 布局**
+//   （那会和没重编的几十个 DLL 失配崩溃）。所以用一张独立的小映射
+//   "QolObsToastToggle"，只放 enabled + 版本号；不碰原共享内存一个字节。
+//   热键：默认 F10（F4~F9 已被 autoharvest/pa/hunt/camera/mine/manager 占用）。
+//   可用 qol_hotkeys.txt 的 `toast=` 行改键（复用同一套解析）。
+// ============================================================
+static const wchar_t* OBS_TOGGLE_MAP   = L"QolObsToastToggle";
+static const wchar_t* OBS_TOGGLE_MUTEX = L"QolObsToastToggleLock";
+static const UINT32   OBS_TOGGLE_MAGIC = 0x544F4747;  // 'TGG?'
+struct ObsToggleShm {
+    UINT32 magic;
+    LONG   enabled;      // 1=显示（默认），0=隐藏
+    WORD   vk;           // 当前热键 VK（默认 VK_F10），0=禁用热键
+    WORD   reserved;
+};
+
+// 进程内唯一一份映射视图缓存（每 DLL 各有自己的，但都指向同一共享内存）
+static ObsToggleShm* g_obsToggle = nullptr;
+static HANDLE        g_obsToggleMap = nullptr;
+
+inline ObsToggleShm* obsToggleState() {
+    if (g_obsToggle) return g_obsToggle;
+    // 用命名 mutex 串行化"创建 + 初始化"，避免两个 DLL 同时写初值
+    HANDLE mx = CreateMutexW(nullptr, FALSE, OBS_TOGGLE_MUTEX);
+    if (mx) WaitForSingleObject(mx, 2000);
+    g_obsToggleMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+                        PAGE_READWRITE, 0, sizeof(ObsToggleShm), OBS_TOGGLE_MAP);
+    if (g_obsToggleMap) {
+        void* p = MapViewOfFile(g_obsToggleMap, FILE_MAP_ALL_ACCESS, 0, 0,
+                                sizeof(ObsToggleShm));
+        g_obsToggle = reinterpret_cast<ObsToggleShm*>(p);
+        if (g_obsToggle && g_obsToggle->magic != OBS_TOGGLE_MAGIC) {
+            g_obsToggle->magic   = OBS_TOGGLE_MAGIC;
+            g_obsToggle->enabled = 1;         // 默认显示
+            g_obsToggle->vk      = VK_F10;
+            g_obsToggle->reserved = 0;
+        }
+    }
+    if (mx) { ReleaseMutex(mx); CloseHandle(mx); }
+    return g_obsToggle;
+}
+
+// 当前是否允许显示（读不到映射 = 默认显示，保证旧行为不回退）
+inline bool obsToastEnabled() {
+    ObsToggleShm* t = obsToggleState();
+    return !t || t->enabled != 0;
+}
+
 // ---------------- 事件 / toast（写 events[] 环形，既画浮层也可机读） ----------------
 // 共享真相判定：events[] 里还有未过期事件 → true。所有 DLL、所有调用点
 // （看门狗线程 / WndProc / 绘制）读同一份判定，不再有跨 DLL 状态分歧。
 inline bool obsAnyFresh(DWORD now) {
     if (!g_obs) return false;
+    if (!obsToastEnabled()) return false;      // 总开关关 → 一律视为无新鲜提示
     for (int i = 0; i < OBS_EVTS; ++i) {
         const ObsEvent* ev = &g_obs->events[i];
         if (ev->used && ev->t && (DWORD)(now - ev->t) < (DWORD)OBS_TOAST_MS)
@@ -185,6 +239,105 @@ inline void obsScheduleHide() {
         HANDLE th = CreateThread(nullptr, 0, obsHideThread, nullptr, 0, nullptr);
         if (th) CloseHandle(th);
         else InterlockedExchange(&g_obsHideThread, 0);
+    }
+}
+
+// F10 热键监听线程：进程内唯一一条（命名 mutex 抢占），边沿触发翻转 enabled。
+//   - 不写事件表、不建窗口，只改开关映射的 enabled，并立即 Show/Hide owner 窗口。
+//   - 热键 VK 每轮读 qol_hotkeys.txt 的 `toast=` 行（若有），支持游戏内改键。
+inline WORD obsToastHotkeyVk() {
+    ObsToggleShm* t = obsToggleState();
+    return t ? t->vk : VK_F10;
+}
+inline void obsReloadToastHotkey() {
+    // 轻量读 qol_hotkeys.txt 的 "toast=" 行；缺文件/缺行时保持默认 F10。
+    // 只认 F1~F12 / 单字符 A-Z0-9 / VK_ 十进制，避免引入整套 hotkey.cpp 依赖。
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, L"qol_hotkeys.txt", L"r") != 0 || !f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;   // 行首空白
+        if (_strnicmp(p, "toast", 5) != 0) continue;
+        char* after = p + 5;
+        while (*after == ' ' || *after == '\t') ++after;
+        if (*after != '=') continue;           // 只匹配 "toast=" 行
+        char* v = after + 1;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') ++v;
+        WORD vk = 0;
+        if (_strnicmp(v, "F", 1) == 0) {
+            int n = atoi(v + 1);
+            if (n >= 1 && n <= 12) vk = static_cast<WORD>(VK_F1 + n - 1);
+        } else if (_strnicmp(v, "VK_", 3) == 0) {
+            int n = atoi(v + 3);
+            if (n > 0 && n < 256) vk = static_cast<WORD>(n);
+        } else if (v[0] && !v[1]) {
+            char c = static_cast<char>(toupper(static_cast<unsigned char>(v[0])));
+            vk = (c >= '0' && c <= '9') ? static_cast<WORD>('0' + c - '0')
+               : (c >= 'A' && c <= 'Z') ? static_cast<WORD>('A' + c - 'A') : 0;
+        } else if (_strnicmp(v, "none", 4) == 0) {
+            vk = 0;
+        }
+        fclose(f);
+        ObsToggleShm* t = obsToggleState();
+        if (t && vk != t->vk) {
+            // 换键：同时清掉按下锁存，避免旧键残留
+            InterlockedExchange16(reinterpret_cast<volatile short*>(&t->vk),
+                                  static_cast<short>(vk));
+        }
+        return;
+    }
+    fclose(f);
+}
+inline DWORD WINAPI obsToggleWatchThread(LPVOID) {
+    bool prevDown = false;
+    DWORD lastCfg = 0;
+    for (;;) {
+        Sleep(60);
+        DWORD now = GetTickCount();
+        if (now - lastCfg >= 2000) { obsReloadToastHotkey(); lastCfg = now; }
+        WORD vk = obsToastHotkeyVk();
+        bool down = false;
+        if (vk) down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        if (down && !prevDown) {           // 边沿触发：按下瞬间翻转一次
+            ObsToggleShm* t = obsToggleState();
+            if (t) {
+                const LONG next = t->enabled ? 0 : 1;
+                InterlockedExchange(&t->enabled, next);
+                HWND w = g_obs ? g_obs->ownerWnd : nullptr;
+                if (w && IsWindow(w)) {
+                    if (next) {
+                        // 开：恢复不透明度（保留 LWA_ALPHA 标志）
+                        SetLayeredWindowAttributes(w, 0, 228, LWA_ALPHA);
+                        if (obsAnyFresh(GetTickCount())) ShowWindow(w, SW_SHOWNA);
+                    } else {
+                        // 关：alpha=0 完全透明 + 隐藏。保留 LWA_ALPHA 标志是关键——
+                        // 未重编的旧 DLL 在 obsPush 里的兜底只在"无 LWA_ALPHA 标志"
+                        // 时才改回 228，因此它发的提示即使 ShowWindow 也仍然透明不可见。
+                        SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA);
+                        ShowWindow(w, SW_HIDE);
+                    }
+                }
+            }
+        }
+        prevDown = down;
+    }
+    return 0;
+}
+inline void obsEnsureToggleWatch() {
+    // 命名 mutex 保证进程内只有一条监听线程 —— 谁抢到谁起，其余 DLL 跳过。
+    // 用"已存在的命名 mutex 持锁不放"作为进程级 once 标志：
+    // 第一个 CreateMutex 后 Wait 成功并保持不释放；其它 DLL Wait 超时即跳过。
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+    HANDLE mx = CreateMutexW(nullptr, FALSE, L"QolObsToastToggleOnce");
+    if (!mx) return;
+    if (WaitForSingleObject(mx, 0) == WAIT_OBJECT_0) {
+        HANDLE th = CreateThread(nullptr, 0, obsToggleWatchThread, nullptr, 0, nullptr);
+        if (th) CloseHandle(th);   // 故意不 ReleaseMutex：让后续 DLL 都 Wait 超时
+    } else {
+        CloseHandle(mx);
     }
 }
 
@@ -236,10 +389,15 @@ inline void obsPush(const wchar_t* text, int severity, int durationMs) {
             !(flags & LWA_ALPHA)) {
             SetLayeredWindowAttributes(w, 0, 228, LWA_ALPHA);
         }
-        ShowWindow(w, SW_SHOWNA);
-        obsRedraw(w);                         // 离屏渲染 + BitBlt 一次提交
-        PostMessageW(w, WM_USER + 1, 0, 0);   // 消息循环正常时让 WndProc 再刷/隐藏
-        obsScheduleHide();                    // 消息循环不正常时的隐藏兜底
+        if (obsToastEnabled()) {
+            ShowWindow(w, SW_SHOWNA);
+            obsRedraw(w);                     // 离屏渲染 + BitBlt 一次提交
+            PostMessageW(w, WM_USER + 1, 0, 0); // 消息循环正常时让 WndProc 再刷/隐藏
+            obsScheduleHide();                // 消息循环不正常时的隐藏兜底
+        } else {
+            // 总开关关闭：事件仍写入共享表（机读可用），但不显示浮层
+            if (IsWindowVisible(w)) ShowWindow(w, SW_HIDE);
+        }
     }
 }
 inline void Event(const wchar_t* text, int severity = 0, int durationMs = OBS_TOAST_MS) {
@@ -566,6 +724,10 @@ inline void Init(HMODULE hModule) {
         obsSweepOrphanWindows(g_obs->ownerWnd);
 
     if (mx) { ReleaseMutex(mx); CloseHandle(mx); }
+
+    // 2026-11-24：启动进程唯一的 toast 热键监听（F10 切换显示/隐藏）。
+    // 必须在释放上面的 Init 锁之后，且内部用命名 mutex 保证只起一条线程。
+    obsEnsureToggleWatch();
 }
 
 inline void Shutdown() {
