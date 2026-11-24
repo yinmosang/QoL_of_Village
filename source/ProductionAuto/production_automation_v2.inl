@@ -2055,7 +2055,9 @@ static void PaCreateProcessingUi(void* machineStatus, u64 gid, bool fromAutoFeed
         // 2026-11-14：恢复为浮层 qol::obs::OBS_TOAST_MS ms；同条在窗口期内只发一次，避免刷屏。
         static u64 s_lastBaseIdToast = 0;
         const u64 baseToastNow = GetTickCount64();
-        if (s_lastBaseIdToast == 0 || baseToastNow - s_lastBaseIdToast >= qol::obs::OBS_TOAST_MS) {
+        // 2026-11-24：节流 5s→30s。每 10 秒维护一轮、每轮失败都告警，旧节流
+        // 窗口恰好等于显示时长，肉眼看是 toast 永不消失（配合 obsPush 去重）。
+        if (s_lastBaseIdToast == 0 || baseToastNow - s_lastBaseIdToast >= 30000) {
             s_lastBaseIdToast = baseToastNow;
             qol::obs::EventF(3, qol::obs::OBS_TOAST_MS,
                 L"[PA] 自动投料机无合法 baseID：far/manpu UI 未建（动画回归风险）");
@@ -2093,7 +2095,8 @@ static void PaCreateProcessingUi(void* machineStatus, u64 gid, bool fromAutoFeed
             // 避免 256 台机器同时维护动画时把 toast 刷成常驻。
             static u64 s_lastManpuToast = 0;
             const u64 manpuToastNow = GetTickCount64();
-            if (s_lastManpuToast == 0 || manpuToastNow - s_lastManpuToast >= qol::obs::OBS_TOAST_MS) {
+            // 2026-11-24：节流 5s→30s（同 baseID 条，避免循环告警常驻）
+            if (s_lastManpuToast == 0 || manpuToastNow - s_lastManpuToast >= 30000) {
                 s_lastManpuToast = manpuToastNow;
                 qol::obs::EventF(2, qol::obs::OBS_TOAST_MS,
                     L"[PA] manpu UI 建失败（加工动画可能缺失）");

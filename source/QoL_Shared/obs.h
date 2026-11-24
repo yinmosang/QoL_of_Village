@@ -94,8 +94,14 @@ inline HWND obsEnsureWindow();
 inline void obsPaintWindow(HWND, HDC);
 inline void obsRedraw(HWND);
 // 自动隐藏：不依赖窗口线程的消息循环（历史失败根因之一）。
-static volatile LONG g_obsHideAt     = 0;   // GetTickCount 过期时刻，0=无待隐藏
-static volatile LONG g_obsHideThread = 0;   // 1=已有隐藏线程在跑
+// 2026-11-24【重构】隐藏真相全部收进共享内存，不再依赖每 DLL 各自的 static：
+//   - 旧版每 DLL 一份 g_obsHideAt + g_obsHideThread，只有"最后发提示的 DLL"
+//     的线程在跑，它却拿"全表最新事件"顺延 → 任何持续刷新的提示都会把
+//     整块浮层的隐藏无限推迟，所有提示看起来都"不消失"。
+//   - 新版：events[] 里每条事件自带 t，各 DLL 的看门狗线程每 200ms 轮询
+//     共享表；只要没有任何未过期事件就隐藏。任何 DLL 有任何提示到期都能
+//     正确收敛，不再被别的 DLL 的刷新牵着走。
+static volatile LONG g_obsHideThread = 0;   // 1=已有隐藏线程在跑（每 DLL 一份）
 // 2026-11-14：浮层窗口归「首个 Init 的 DLL」所有。若那是未重编译的旧 DLL，
 // 它的 ObsWndProc 仍按 2500ms 判定，会把新时长的 toast 提前隐藏。
 // 由新 DLL 在 mod_init 里显式调 TakeoverWindow()，首次 obsPush 时把 ownerWnd
@@ -142,45 +148,39 @@ inline void SetStr(const char* mod, const char* key, const wchar_t* v) {
 }
 
 // ---------------- 事件 / toast（写 events[] 环形，既画浮层也可机读） ----------------
-inline DWORD WINAPI obsHideThread(LPVOID) {
-    for (;;) {
-        Sleep(100);
-        const DWORD now = GetTickCount();
-        const DWORD exp = (DWORD)InterlockedCompareExchange(&g_obsHideAt, 0, 0);
-        if (!exp || (LONG)(now - exp) < 0) continue;   // 本 DLL 的到期时刻未到
-
-        // 2026-11-09 22:10 修复：g_obsHideAt / g_obsHideThread 是 header 内的
-        // static，每个 DLL 各有一份。A DLL 的隐藏线程到期时看不到 B DLL 刚发的
-        // 新事件，会把刚显示的窗口立刻藏掉 —— 21:02 实机 visible 在
-        // True/False 间跳变、判据最终落在 HIDDEN 就是这个竞态。
-        // 隐藏决策改以「共享 events[] 里最新事件时刻」为准：所有 DLL 读同一份
-        // 真相，仍有 OBS_TOAST_MS 内的事件就顺延，绝不抢在别人的 toast 前面隐藏。
-        DWORD latest = 0;
-        if (g_obs) {
-            for (int i = 0; i < OBS_EVTS; ++i) {
-                const ObsEvent* ev = &g_obs->events[i];
-                if (ev->used && ev->t && now >= ev->t &&
-                    (now - ev->t) < OBS_TOAST_MS && ev->t > latest)
-                    latest = ev->t;
-            }
-        }
-        if (latest) {
-            const DWORD nextExp = latest + OBS_TOAST_MS;
-            if ((LONG)(nextExp - now) > 0) {
-                InterlockedExchange(&g_obsHideAt, (LONG)nextExp);
-                continue;
-            }
-        }
-
-        HWND w = g_obs ? g_obs->ownerWnd : nullptr;
-        if (w && IsWindow(w)) ShowWindow(w, SW_HIDE);
-        InterlockedExchange(&g_obsHideAt, 0);
-        InterlockedExchange(&g_obsHideThread, 0);
-        return 0;
+// 共享真相判定：events[] 里还有未过期事件 → true。所有 DLL、所有调用点
+// （看门狗线程 / WndProc / 绘制）读同一份判定，不再有跨 DLL 状态分歧。
+inline bool obsAnyFresh(DWORD now) {
+    if (!g_obs) return false;
+    for (int i = 0; i < OBS_EVTS; ++i) {
+        const ObsEvent* ev = &g_obs->events[i];
+        if (ev->used && ev->t && (DWORD)(now - ev->t) < (DWORD)OBS_TOAST_MS)
+            return true;
     }
+    return false;
+}
+
+inline DWORD WINAPI obsHideThread(LPVOID) {
+    // 每 200ms 轮询共享事件表；只要还有新鲜事件就继续守着，一条都没有就隐藏。
+    // 关键差异：不再用每 DLL 的 g_obsHideAt 到期时刻当门控 —— 那个值只有
+    // "最后发提示的 DLL" 自己更新，别的 DLL 的提示不在它的视野里。
+    for (;;) {
+        Sleep(200);
+        if (!g_obs || !g_obs->ownerWnd) break;
+        DWORD now = GetTickCount();
+        if (obsAnyFresh(now)) continue;             // 仍有任意提示未过期 → 继续显示
+
+        HWND w = g_obs->ownerWnd;
+        if (w && IsWindow(w) && IsWindowVisible(w)) ShowWindow(w, SW_HIDE);
+        break;                                       // 收敛：本轮守候结束
+    }
+    InterlockedExchange(&g_obsHideThread, 0);
+    return 0;
 }
 inline void obsScheduleHide() {
-    InterlockedExchange(&g_obsHideAt, (LONG)(GetTickCount() + OBS_TOAST_MS));
+    // 每个 DLL 独立起一条看门狗线程（最多一条同时存活）。任何 DLL 发提示
+    // 都会拉起自己那份，线程读的是同一张共享事件表，彼此不会互相误伤：
+    // 有新鲜事件时所有线程都 continue，全过期时谁先醒来谁隐藏，其余随后退出。
     if (InterlockedCompareExchange(&g_obsHideThread, 1, 0) == 0) {
         HANDLE th = CreateThread(nullptr, 0, obsHideThread, nullptr, 0, nullptr);
         if (th) CloseHandle(th);
@@ -194,6 +194,19 @@ inline void obsPush(const wchar_t* text, int severity, int durationMs) {
     // 统一走 OBS_TOAST_MS；调用处传 OBS_TOAST_MS 只为语义一致。
     (void)durationMs;
     if (!g_obs) return;
+
+    // 2026-11-24【去重】同文本事件仍在显示期内 → 不重复推送。
+    // PA 每 10 秒维护一轮，manpu 建失败每轮都告警；调用侧旧节流窗口恰好等于
+    // 显示时长（OBS_TOAST_MS），旧的刚到期新的又顶上，肉眼看是 toast 永不消失。
+    {
+        const DWORD nowMs = GetTickCount();
+        for (int i = 0; i < OBS_EVTS; ++i) {
+            const ObsEvent* ev = &g_obs->events[i];
+            if (ev->used && ev->t && wcscmp(ev->text, text) == 0 &&
+                (DWORD)(nowMs - ev->t) < (DWORD)OBS_TOAST_MS)
+                return;   // 同一条还在屏上：不重推、不重锚、不顺延隐藏时刻
+        }
+    }
 
     // 关键：不再假设「首个 Init 的 DLL 一定建过窗口」。任何 DLL 发 toast 时，
     // ownerWnd 无效就由本 DLL 在锁内认领创建（见 obsEnsureWindow）。
@@ -323,15 +336,17 @@ inline void obsRedraw(HWND w) {
 inline LRESULT CALLBACK ObsWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_DESTROY) { return 0; }
     if (msg == WM_TIMER || msg == WM_USER + 1) {
-        // 轮询共享内存：有未过期事件就显示并重绘，否则隐藏
-        bool any = false;
-        if (g_obs) {
-            DWORD now = GetTickCount();
-            for (int i = 0; i < OBS_EVTS; ++i) {
-                ObsEvent* e = &g_obs->events[i];
-                if (e->used && now - e->t < OBS_TOAST_MS) { any = true; break; }
-            }
+        // 2026-11-24【孤儿守卫】只有 owner 窗口允许据此自我显示。
+        // 历史竞态/接管残留的重复浮层窗口各自带 250ms 轮询，旧 DLL 编译的
+        // WndProc 无此守卫，会周期性 ShowWindow 自我复活 —— 表现为
+        // 「游戏外一个、游戏里一个」双 toast（2026-11-24 实机）。非 owner 一律自隐。
+        if (g_obs && g_obs->ownerWnd != w) {
+            if (IsWindowVisible(w)) ShowWindow(w, SW_HIDE);
+            return 0;
         }
+        // 轮询共享内存：有未过期事件就显示并重绘，否则隐藏。
+        // 2026-11-24：判定收口到 obsAnyFresh（与看门狗线程同一份真相）。
+        bool any = obsAnyFresh(GetTickCount());
         if (any) {
             if (!IsWindowVisible(w)) ShowWindow(w, SW_SHOWNA);
             InvalidateRect(w, nullptr, FALSE);
@@ -354,6 +369,28 @@ inline LRESULT CALLBACK ObsWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 // 旧设计只让「首个 CreateFileMapping 的 DLL」建窗口，且 created 判定读的是
 // 未清零的 GetLastError()，一旦判错就全库 ownerWnd 恒空 → toast 只写共享内存、
 // 永远不显示（2026-11-07 23:16 实机：仅自建窗口的 TF/PA/CameraZoom 有 HUD）。
+//
+// 2026-11-24【孤儿清扫】销毁本进程内除 keep 以外的全部同类浮层窗口。
+// 场景：Init/Ensure 建窗竞态、或旧版接管后旧窗口仅被隐藏而其 250ms 轮询
+// 仍在跑（旧 DLL 的 WndProc 无孤儿守卫），孤儿会周期性自我复活成第二块
+// toast。用 PostMessage(WM_CLOSE) 让窗口在自己的线程销毁
+// （DestroyWindow 跨线程调用会静默失败）。
+inline void obsSweepOrphanWindows(HWND keep) {
+    struct SweepCtx { DWORD pid; HWND keep; };
+    SweepCtx ctx = { GetCurrentProcessId(), keep };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        SweepCtx* c = reinterpret_cast<SweepCtx*>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid != c->pid || h == c->keep) return TRUE;
+        wchar_t cls[64] = { 0 };
+        if (!GetClassNameW(h, cls, 64) || wcscmp(cls, OBS_CLS) != 0) return TRUE;
+        KillTimer(h, 1);
+        PostMessageW(h, WM_CLOSE, 0, 0);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+}
+
 inline HWND obsEnsureWindow() {
     if (!g_obs) return nullptr;
     // 一次性接管请求（只有显式调过 TakeoverWindow() 且自己不是窗口 owner 的 DLL 会置位）
@@ -363,8 +400,10 @@ inline HWND obsEnsureWindow() {
     if (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd) && !take)
         return g_obs->ownerWnd;
 
-    HANDLE mx = CreateMutexW(nullptr, FALSE, L"QolObsWndLock");
-    if (mx) WaitForSingleObject(mx, 3000);
+    // 2026-11-24：改用与 Init 同一把锁（旧版单独的 QolObsWndLock 与 Init 的
+    // QolObsInit 互不互斥，是「双浮层窗口」竞态的根因之一）。
+    HANDLE mx = CreateMutexW(nullptr, FALSE, OBS_MUTEX);
+    if (mx) WaitForSingleObject(mx, 5000);
     HWND w = nullptr;
     HWND oldWnd = (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd))
         ? g_obs->ownerWnd : nullptr;
@@ -424,6 +463,9 @@ inline HWND obsEnsureWindow() {
                 g_obsOwner = true;
                 SetTimer(w, 1, 250, nullptr);
                 ShowWindow(w, SW_HIDE);
+                // 2026-11-24：接管/重建成功后清扫旧浮层（旧 DLL 的 WndProc
+                // 无孤儿守卫，隐藏的旧窗口会周期性自我复活成双 toast）
+                obsSweepOrphanWindows(w);
             }
         }
     }
@@ -473,6 +515,16 @@ inline void Init(HMODULE hModule) {
     // 仅首个 Init 的 DLL 创建浮层窗口
     if (g_obs && created && g_obs->magic == OBS_MAGIC) {
         g_obsOwner = true;
+        // 2026-11-24【收养守卫】obsEnsureWindow 兜底路径可能在本 DLL 拿锁前
+        // 已建过窗口（ownerWnd 已有效）——此时收养，绝不重建。旧版无条件
+        // CreateWindowExW 会盖掉 ownerWnd，留下两个都带 250ms 轮询、都会
+        // 自我复活的浮层窗口（双 toast 的实机根因）。
+        HWND adopt = (g_obs->ownerWnd && IsWindow(g_obs->ownerWnd))
+            ? g_obs->ownerWnd : nullptr;
+        if (adopt) {
+            g_obsWnd = adopt;
+            g_obsTimer = SetTimer(adopt, 1, 250, nullptr);
+        } else {
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = ObsWndProc;
@@ -505,7 +557,13 @@ inline void Init(HMODULE hModule) {
                 g_obsTimer = SetTimer(g_obsWnd, 1, 250, nullptr);
             }
         }
+        }  // 2026-11-24 收养守卫 else 结束
     }
+
+    // 2026-11-24：收尾清扫 —— 只要共享层 owner 窗口有效，就销毁进程内同类
+    // 孤儿浮层（自愈历史竞态/旧版接管留下的双窗口）。无论映射是否本 DLL 首建。
+    if (g_obs && g_obs->ownerWnd && IsWindow(g_obs->ownerWnd))
+        obsSweepOrphanWindows(g_obs->ownerWnd);
 
     if (mx) { ReleaseMutex(mx); CloseHandle(mx); }
 }
